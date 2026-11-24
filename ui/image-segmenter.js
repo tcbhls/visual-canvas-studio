@@ -136,13 +136,16 @@ export function estimateBackgroundModel(rgba, w, h, region = null) {
   );
   const useGradient = edgeSpread > 6 && edgeSpread < 52;
 
-  const tLow = Math.max(13, Math.min(34, Math.round(avgNoise * 2.2 + 13)));
-  const tHigh = Math.max(tLow + 18, Math.min(64, tLow + 24));
+  const tSoft = Math.max(5, Math.min(18, Math.round(avgNoise * 2.2 + 4)));
+  const tLow = Math.max(10, Math.min(30, Math.round(avgNoise * 2.4 + 9)));
+  const tHigh = Math.max(tLow + 18, Math.min(62, tLow + 24));
 
   return {
     r: bgR,
     g: bgG,
     b: bgB,
+    avgNoise,
+    tSoft,
     tLow,
     tHigh,
     tMid: Math.round((tLow + tHigh) * 0.5),
@@ -165,9 +168,55 @@ export function estimateBackgroundModel(rgba, w, h, region = null) {
 }
 
 /**
- * 下采样 RGBA 用于超高速连通域分析（1024px -> 384px 仅需 ~20ms）
+ * 判别像素是否跨越了真正的异色边界（既比较相邻像素，也对比当前连通域主色）：
+ * - 平滑渐变、同色明暗过渡与灰度抗锯齿尖端均返回 false（保持连贯不断裂）
+ * - 高饱和彩色（如暖橙光晕）与纯白/无彩色（如白色月牙）或不同色相突变返回 true（精准分离）
  */
-function downsampleRgba(rgba, w, h, maxSide = 384) {
+function isDistinctColorBoundary(r1, g1, b1, r2, g2, b2, mode, compRgb = null) {
+  const d = rgbDist(r1, g1, b1, r2, g2, b2);
+  if (mode === 'fine') return d > 66;
+
+  const getSat = (r, g, b) => {
+    const mx = Math.max(r, g, b);
+    const mn = Math.min(r, g, b);
+    return mx === 0 ? 0 : (mx - mn) / mx;
+  };
+  const hueDiff = (ar, ag, ab, br, bg, bb) => {
+    const amx = Math.max(ar, ag, ab), amn = Math.min(ar, ag, ab), as = Math.max(1, amx - amn);
+    const bmx = Math.max(br, bg, bb), bmn = Math.min(br, bg, bb), bs = Math.max(1, bmx - bmn);
+    return Math.hypot((ar - amn) / as - (br - bmn) / bs, (ag - amn) / as - (bg - bmn) / bs, (ab - amn) / as - (bb - bmn) / bs);
+  };
+
+  const sat2 = getSat(r2, g2, b2);
+  if (d > 78) {
+    const sat1 = getSat(r1, g1, b1);
+    if ((sat1 > 0.26 && sat2 < 0.12) || (sat2 > 0.26 && sat1 < 0.12)) return true;
+    if (sat1 > 0.22 && sat2 > 0.22 && hueDiff(r1, g1, b1, r2, g2, b2) > 0.6) return true;
+  }
+
+  // 与所属元素核心主色做跨像素防桥接校验（防止 1px 抗锯齿过渡像素把暖橙光晕与纯白月牙粘连）
+  if (compRgb) {
+    const [cr, cg, cb] = compRgb;
+    const dc = rgbDist(cr, cg, cb, r2, g2, b2);
+    if (dc > 82) {
+      const satC = getSat(cr, cg, cb);
+      const lumC = 0.299 * cr + 0.587 * cg + 0.114 * cb;
+      const lum2 = 0.299 * r2 + 0.587 * g2 + 0.114 * b2;
+      // 暖色/高饱和元素核 vs 高亮无彩色白弧（或反向）
+      if (satC > 0.28 && sat2 < 0.13 && lum2 > 165) return true;
+      if (satC < 0.13 && lumC > 165 && sat2 > 0.26) return true;
+      // 不同色相的高饱和核
+      if (satC > 0.28 && sat2 > 0.28 && hueDiff(cr, cg, cb, r2, g2, b2) > 0.68) return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * 下采样 RGBA（默认最高 1024px 全分辨率分析，不跳过 1~2px 细锐尖端）
+ */
+function downsampleRgba(rgba, w, h, maxSide = 1024) {
   const scale = Math.min(1, maxSide / Math.max(w, h));
   const sw = Math.max(1, Math.round(w * scale));
   const sh = Math.max(1, Math.round(h * scale));
@@ -191,82 +240,186 @@ function downsampleRgba(rgba, w, h, maxSide = 384) {
 }
 
 /**
- * 在纯像素数组上自动识别所有独立前景元素（支持“智能成组”和“精细拆件”两种模式）
- * 返回：{ bgModel, scale, gridW, gridH, labels, elements: [{ id, name, x, y, w, h, area, dominantColor, labelIds }] }
+ * 全分辨率双阈值滞后分割引擎（Core Seeds + Soft Tip/Glow Watershed）：
+ * 1. 先在强前景核（d >= tCore）上执行边缘保色连通域分割，精准分离紧邻异色元素（如白弧与橙色太阳）
+ * 2. 再从有效元素核向外沿软阈值（d >= tSoft）多源滞后生长，完整追踪 1px 尖细笔锋与柔和径向光晕，
+ *    彻底杜绝「尖端遗留底图」「光晕切出锯齿硬边」「底图残留棕色残影」三大问题。
  */
 export function analyzeRgbaElements(rgba, fullW, fullH, options = {}) {
   const mode = options.mode || 'smart'; // 'smart' | 'fine'
-  const colorSplitThreshold = mode === 'fine' ? 72 : 999;
-  const ds = downsampleRgba(rgba, fullW, fullH, 384);
+  const ds = downsampleRgba(rgba, fullW, fullH, 1024);
   const { data, w, h, scale } = ds;
 
   const bgModel = estimateBackgroundModel(data, w, h);
-  const fg = new Uint8Array(w * h);
-  const threshold = options.threshold || bgModel.tMid;
+  const totalPx = w * h;
+  const distMap = new Float32Array(totalPx);
+  const coreFg = new Uint8Array(totalPx);
+  const softFg = new Uint8Array(totalPx);
+  const tCore = options.threshold || bgModel.tMid;
+  const tSoft = bgModel.tSoft || Math.max(5, Math.round(bgModel.tLow * 0.55));
 
-  // 若图本身带透明通道（PNG 透明图），直接以 alpha > 30 为前景
+  // 若图本身带透明通道（PNG 透明图），直接以 alpha 区分前景
   let transparentCount = 0;
   for (let i = 3; i < data.length; i += 16) {
     if (data[i] < 200) transparentCount++;
   }
-  const hasRealAlpha = transparentCount > (w * h) * 0.015;
+  const hasRealAlpha = transparentCount > totalPx * 0.015;
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const pi = y * w + x;
       const off = pi * 4;
       const a = data[off + 3];
-      if (a < 28) continue;
+      if (a < 8) continue;
       if (hasRealAlpha) {
-        fg[pi] = 1;
+        distMap[pi] = a;
+        if (a >= 36) coreFg[pi] = 1;
+        if (a >= 10) softFg[pi] = 1;
       } else {
         const [br, bg, bb] = bgModel.at(x, y);
         const d = rgbDist(data[off], data[off + 1], data[off + 2], br, bg, bb);
-        if (d >= threshold) fg[pi] = 1;
+        distMap[pi] = d;
+        if (d >= tCore) coreFg[pi] = 1;
+        if (d >= tSoft) softFg[pi] = 1;
       }
     }
   }
 
-  // 8 邻域迭代 BFS 连通域标记
-  const labels = new Int32Array(w * h);
-  const queue = new Int32Array(w * h);
-  const rawComps = [];
+  // 阶段 1：先在强前景核（d >= tStrong）提取高对比主体，再在中等前景（d >= tCore）补提淡灰文字，
+  // 防止外圈淡光晕在主体尚未成型前就把相邻白弧与发光太阳桥接合并
+  const tStrong = hasRealAlpha ? 80 : Math.max(tCore + 22, 48);
+  const labels = new Int32Array(totalPx);
+  const queue = new Int32Array(totalPx);
+  const compByLabel = new Map();
+  const minCoreCount = Math.max(8, Math.round(totalPx * 0.000018));
   let nextLabel = 1;
 
-  for (let start = 0; start < w * h; start++) {
-    if (!fg[start] || labels[start] !== 0) continue;
-    const label = nextLabel++;
-    let head = 0;
-    let tail = 0;
-    queue[tail++] = start;
-    labels[start] = label;
+  const runCorePass = (passThreshold) => {
+    for (let start = 0; start < totalPx; start++) {
+      if (distMap[start] < passThreshold || labels[start] !== 0) continue;
+      const label = nextLabel++;
+      let head = 0;
+      let tail = 0;
+      queue[tail++] = start;
+      labels[start] = label;
 
-    let minX = w;
-    let minY = h;
-    let maxX = 0;
-    let maxY = 0;
-    let count = 0;
-    let sr = 0;
-    let sg = 0;
-    let sb = 0;
+      let minX = w;
+      let minY = h;
+      let maxX = 0;
+      let maxY = 0;
+      let count = 0;
+      let sr = 0;
+      let sg = 0;
+      let sb = 0;
 
-    while (head < tail) {
-      const cur = queue[head++];
+      while (head < tail) {
+        const cur = queue[head++];
+        const cx = cur % w;
+        const cy = (cur - cx) / w;
+        const coff = cur * 4;
+        const cr = data[coff];
+        const cg = data[coff + 1];
+        const cb = data[coff + 2];
+
+        count++;
+        sr += cr;
+        sg += cg;
+        sb += cb;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+        const curMean = [sr / count, sg / count, sb / count];
+
+        for (let dy = -1; dy <= 1; dy++) {
+          const ny = cy + dy;
+          if (ny < 0 || ny >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = cx + dx;
+            if (nx < 0 || nx >= w) continue;
+            const ni = ny * w + nx;
+            if (distMap[ni] < passThreshold || labels[ni] !== 0) continue;
+            const noff = ni * 4;
+            if (isDistinctColorBoundary(cr, cg, cb, data[noff], data[noff + 1], data[noff + 2], mode, curMean)) {
+              continue;
+            }
+            labels[ni] = label;
+            queue[tail++] = ni;
+          }
+        }
+      }
+
+      const bw = maxX - minX + 1;
+      const bh = maxY - minY + 1;
+      if (count < minCoreCount || (bw > w * 0.96 && bh > h * 0.96 && count > totalPx * 0.82)) {
+        for (let k = 0; k < tail; k++) {
+          labels[queue[k]] = 0;
+        }
+        continue;
+      }
+
+      compByLabel.set(label, {
+        labelIds: [label],
+        minX,
+        minY,
+        maxX,
+        maxY,
+        bw,
+        bh,
+        count,
+        r: sr / count,
+        g: sg / count,
+        b: sb / count,
+      });
+    }
+  };
+
+  // 先提取高对比强主体（白弧、橙太阳等）
+  runCorePass(tStrong);
+
+  // 阶段 2A：先从强主体向外生长完整 1px 尖端与平滑外晕（避免太阳外圈光晕在 1B 中被误判成独立碎片）
+  const growSoftWatershed = () => {
+    let wHead = 0;
+    let wTail = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const pi = y * w + x;
+        const lbl = labels[pi];
+        if (!lbl) continue;
+        let hasSoftNeighbor = false;
+        for (let dy = -1; dy <= 1 && !hasSoftNeighbor; dy++) {
+          const ny = y + dy;
+          if (ny < 0 || ny >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = x + dx;
+            if (nx < 0 || nx >= w) continue;
+            const ni = ny * w + nx;
+            if (softFg[ni] && labels[ni] === 0) {
+              hasSoftNeighbor = true;
+              break;
+            }
+          }
+        }
+        if (hasSoftNeighbor) {
+          queue[wTail++] = pi;
+        }
+      }
+    }
+
+    while (wHead < wTail) {
+      const cur = queue[wHead++];
+      const lbl = labels[cur];
+      const comp = compByLabel.get(lbl);
+      if (!comp) continue;
+      const compMean = [comp.r, comp.g, comp.b];
       const cx = cur % w;
       const cy = (cur - cx) / w;
       const coff = cur * 4;
       const cr = data[coff];
       const cg = data[coff + 1];
       const cb = data[coff + 2];
-
-      count++;
-      sr += cr;
-      sg += cg;
-      sb += cb;
-      if (cx < minX) minX = cx;
-      if (cx > maxX) maxX = cx;
-      if (cy < minY) minY = cy;
-      if (cy > maxY) maxY = cy;
 
       for (let dy = -1; dy <= 1; dy++) {
         const ny = cy + dy;
@@ -276,39 +429,38 @@ export function analyzeRgbaElements(rgba, fullW, fullH, options = {}) {
           const nx = cx + dx;
           if (nx < 0 || nx >= w) continue;
           const ni = ny * w + nx;
-          if (!fg[ni] || labels[ni] !== 0) continue;
-          if (colorSplitThreshold < 500) {
-            const noff = ni * 4;
-            if (rgbDist(cr, cg, cb, data[noff], data[noff + 1], data[noff + 2]) > colorSplitThreshold) {
-              continue;
-            }
+          if (!softFg[ni] || labels[ni] !== 0) continue;
+          const noff = ni * 4;
+          if (isDistinctColorBoundary(cr, cg, cb, data[noff], data[noff + 1], data[noff + 2], mode, compMean)) {
+            continue;
           }
-          labels[ni] = label;
-          queue[tail++] = ni;
+          labels[ni] = lbl;
+          queue[wTail++] = ni;
+          if (nx < comp.minX) comp.minX = nx;
+          if (nx > comp.maxX) comp.maxX = nx;
+          if (ny < comp.minY) comp.minY = ny;
+          if (ny > comp.maxY) comp.maxY = ny;
+          comp.count++;
         }
       }
     }
+  };
 
-    const bw = maxX - minX + 1;
-    const bh = maxY - minY + 1;
-    // 过滤极小噪点与覆盖整张画布的误判背景块
-    if (count < 8 || (bw > w * 0.96 && bh > h * 0.96 && count > w * h * 0.82)) {
-      continue;
+  growSoftWatershed();
+  // 阶段 1B + 2B：补提图中独立的低对比淡灰文字/次要元素并生长其软边
+  if (tCore < tStrong) {
+    const beforeCount = compByLabel.size;
+    runCorePass(tCore);
+    if (compByLabel.size > beforeCount) {
+      growSoftWatershed();
     }
+  }
 
-    rawComps.push({
-      labelIds: [label],
-      minX,
-      minY,
-      maxX,
-      maxY,
-      bw,
-      bh,
-      count,
-      r: sr / count,
-      g: sg / count,
-      b: sb / count,
-    });
+  const rawComps = [];
+  for (const c of compByLabel.values()) {
+    c.bw = c.maxX - c.minX + 1;
+    c.bh = c.maxY - c.minY + 1;
+    rawComps.push(c);
   }
 
   // 智能成组：将同一水平行内高度较小且间距紧凑的文字笔画/汉字合并为一个可整体拖动的文字区块
@@ -382,15 +534,17 @@ export function analyzeRgbaElements(rgba, fullW, fullH, options = {}) {
       }
     }
 
-    // 过滤落单的微小噪点
-    const validGroups = groups.filter((g) => g.count >= 22 || g.bw >= 18);
+    // 过滤落单的微小噪点（按分辨率自适应阈值）
+    const minTextPx = Math.max(22, Math.round(totalPx * 0.00009));
+    const minTextW = Math.max(18, Math.round(w * 0.025));
+    const validGroups = groups.filter((g) => g.count >= minTextPx || g.bw >= minTextW);
     merged = [...graphicComps, ...validGroups];
   }
 
   // 面积从大到小排序（大图在下，小图在上，方便点选），再映射回原图全分辨率坐标
   merged.sort((a, b) => b.bw * b.bh - a.bw * a.bh);
 
-  const pad = 3;
+  const pad = 4;
   const elements = merged.slice(0, 36).map((c, idx) => {
     const x = Math.max(0, Math.floor(c.minX / scale) - pad);
     const y = Math.max(0, Math.floor(c.minY / scale) - pad);
@@ -480,17 +634,21 @@ export function extractAndInpaintRgba(baseRgba, fullW, fullH, analysis, target) 
   const holeMask = new Uint8Array(bw * bh);
   let fgPixelCount = 0;
 
-  // 若是 labelSet 模式，判断原图该像素邻近 1 个分析格是否属于该元素，允许 2px 抗锯齿外扩
+  // 全分辨率分析时精准命中自身标签，消除低分网格阶梯锯齿；仅超大图（scale < 1）允许 1 格抗锯齿邻域
   const nearLabel = (fx, fy) => {
     if (!labelSet) return true;
     const gx = Math.min(gridW - 1, Math.max(0, Math.floor(fx * scale)));
     const gy = Math.min(gridH - 1, Math.max(0, Math.floor(fy * scale)));
-    if (labelSet.has(labels[gy * gridW + gx])) return true;
-    // 允许 1 格邻域以保留高分辨率抗锯齿软边
+    const own = labels[gy * gridW + gx];
+    if (labelSet.has(own)) return true;
+    // 若像素已明确属于另一个独立元素，严禁跨界抢占
+    if (own !== 0) return false;
+    // 仅允许 1px 紧贴边缘的淡背景过渡像素（平滑羽化外边缘，绝不产生锯齿方块）
     for (let dy = -1; dy <= 1; dy++) {
       const ny = gy + dy;
       if (ny < 0 || ny >= gridH) continue;
       for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
         const nx = gx + dx;
         if (nx < 0 || nx >= gridW) continue;
         if (labelSet.has(labels[ny * gridW + nx])) return true;
@@ -499,10 +657,17 @@ export function extractAndInpaintRgba(baseRgba, fullW, fullH, analysis, target) 
     return false;
   };
 
-  // 根据前景主色与背景色的真实对比度自适应调整软抠图上限，消除白/橙图形外圈 1px 暗边
+  // 根据前景主色与背景色的真实对比度自适应调整软抠图上下限：
+  // 上限贴近真实前景对比度（~0.92×fgContrast），确保抗锯齿灰边（如白弧 60% 灰边）被正确还原为半透明纯白而非不透明灰线；
+  // 下限用 tSoft（~6）配合平滑缓入，让柔和发光/细锐尖端丝滑渐变到完全透明（0），不截断、不留残影
   const fgMean = Array.isArray(target.meanRgb) ? target.meanRgb : null;
   const fgContrast = fgMean ? rgbDist(fgMean[0], fgMean[1], fgMean[2], localBg.r, localBg.g, localBg.b) : 90;
-  const adaptiveHigh = Math.max(localBg.tHigh, Math.min(185, Math.round(localBg.tLow + fgContrast * 0.62)));
+  const alphaFloor = isBoxMode
+    ? localBg.tLow
+    : Math.max(3, (localBg.tSoft || Math.round(localBg.tLow * 0.5)) - 1);
+  const adaptiveHigh = isBoxMode
+    ? Math.max(localBg.tHigh, Math.min(185, Math.round(alphaFloor + fgContrast * 0.68)))
+    : Math.max(localBg.tHigh, Math.min(235, Math.round(alphaFloor + fgContrast * 0.90)));
 
   let trimMinX = bw;
   let trimMinY = bh;
@@ -550,25 +715,55 @@ export function extractAndInpaintRgba(baseRgba, fullW, fullH, analysis, target) 
         bg = bgRgb[1];
         bb = bgRgb[2];
         const d = rgbDist(r, g, b, br, bg, bb);
-        if (d <= localBg.tLow) {
+        if (d <= alphaFloor) {
           alphaNorm = 0;
-        } else if (d >= adaptiveHigh) {
-          alphaNorm = 1;
         } else {
-          alphaNorm = (d - localBg.tLow) / Math.max(1, adaptiveHigh - localBg.tLow);
+          // Porter-Duff 解析投影 Alpha：在前景主色方向上精确还原抗锯齿边与径向光晕的物理透明度
+          let alphaProj = 0;
+          if (fgMean && !isBoxMode) {
+            const vr = fgMean[0] - br;
+            const vg = fgMean[1] - bg;
+            const vb = fgMean[2] - bb;
+            const vLen2 = vr * vr + vg * vg + vb * vb;
+            if (vLen2 > 400) {
+              const dot = (r - br) * vr + (g - bg) * vg + (b - bb) * vb;
+              alphaProj = Math.max(0, Math.min(1, dot / vLen2));
+            }
+          }
+          const alphaDist = d >= adaptiveHigh
+            ? 1
+            : (d - alphaFloor) / Math.max(1, adaptiveHigh - alphaFloor);
+          alphaNorm = Math.max(alphaProj, alphaDist);
+          // 先在羽化前把所有属于该元素（含极淡外晕）的像素记入底图修补掩码，确保底图 100% 干净零残影
+          if (!isBoxMode && alphaNorm >= 0.015) {
+            holeMask[ly * bw + lx] = 1;
+          }
+          // 极低对比边缘平滑缓入（消除发光光晕外圈阶梯断层）
+          if (!isBoxMode && d < alphaFloor + 22) {
+            const t = (d - alphaFloor) / 22;
+            alphaNorm *= t * t * (3 - 2 * t);
+          }
         }
       }
 
-      if (alphaNorm <= 0.04) continue;
+      if (alphaNorm <= 0.008) continue;
 
-      // 边缘去杂色（Color Decontamination）：剥离半透明边缘混入的背景色，避免黑边/白边
+      // 物理反混色（Color Decontamination）：按真实 Alpha 剥离背景底色，绝不抬高弱光晕外圈透明度
       let outR = r;
       let outG = g;
       let outB = b;
-      if (!hasRealAlpha && alphaNorm > 0.05 && alphaNorm < 0.98) {
-        outR = clampByte((r - (1 - alphaNorm) * br) / alphaNorm);
-        outG = clampByte((g - (1 - alphaNorm) * bg) / alphaNorm);
-        outB = clampByte((b - (1 - alphaNorm) * bb) / alphaNorm);
+      if (!hasRealAlpha && alphaNorm > 0.01 && alphaNorm < 0.99) {
+        let minPhysAlpha = alphaNorm;
+        if (r > br && br < 254) minPhysAlpha = Math.max(minPhysAlpha, (r - br) / (255 - br));
+        else if (r < br && br > 1) minPhysAlpha = Math.max(minPhysAlpha, (br - r) / br);
+        if (g > bg && bg < 254) minPhysAlpha = Math.max(minPhysAlpha, (g - bg) / (255 - bg));
+        else if (g < bg && bg > 1) minPhysAlpha = Math.max(minPhysAlpha, (bg - g) / bg);
+        if (b > bb && bb < 254) minPhysAlpha = Math.max(minPhysAlpha, (b - bb) / (255 - bb));
+        else if (b < bb && bb > 1) minPhysAlpha = Math.max(minPhysAlpha, (bb - b) / bb);
+        const effA = Math.max(0.08, Math.min(1, minPhysAlpha));
+        outR = clampByte((r - (1 - effA) * br) / effA);
+        outG = clampByte((g - (1 - effA) * bg) / effA);
+        outB = clampByte((b - (1 - effA) * bb) / effA);
       }
 
       const dstOff = (ly * bw + lx) * 4;
@@ -577,7 +772,7 @@ export function extractAndInpaintRgba(baseRgba, fullW, fullH, analysis, target) 
       cutRgba[dstOff + 2] = outB;
       cutRgba[dstOff + 3] = clampByte(alphaNorm * a0);
 
-      if (alphaNorm >= 0.08) {
+      if (alphaNorm >= 0.012) {
         holeMask[ly * bw + lx] = 1;
         fgPixelCount++;
         if (lx < trimMinX) trimMinX = lx;
@@ -588,13 +783,13 @@ export function extractAndInpaintRgba(baseRgba, fullW, fullH, analysis, target) 
     }
   }
 
-  if (fgPixelCount < 10) return null;
+  if (fgPixelCount < 8) return null;
 
   // 2. 修补底图孔洞：
   // - 框选模式下严格限制所有修改均在用户选框 [bx, bx+bw) × [by, by+bh) 内，绝不越界破坏选区外任何 1 像素！
-  // - 自动识别模式允许 4px 膨胀消除 JPG 压缩蚊式噪点环
-  const padInpaint = isBoxMode ? 4 : 10;
-  const dilateR = isBoxMode ? 1 : 4;
+  // - 自动识别模式允许 3px 膨胀（彻底抹净极淡残晕与抗锯齿残丝），但严禁侵蚀其他未拆元素像素
+  const padInpaint = isBoxMode ? 4 : 14;
+  const dilateR = isBoxMode ? 1 : 3;
   const ix0 = Math.max(0, bx - padInpaint);
   const iy0 = Math.max(0, by - padInpaint);
   const ix1 = Math.min(fullW - 1, bx + bw - 1 + padInpaint);
@@ -606,6 +801,14 @@ export function extractAndInpaintRgba(baseRgba, fullW, fullH, analysis, target) 
   const boxMaxGx = bx + bw - 1 - ix0;
   const boxMinGy = by - iy0;
   const boxMaxGy = by + bh - 1 - iy0;
+
+  const isOtherElementPx = (fx, fy) => {
+    if (!labelSet || !labels) return false;
+    const gx = Math.min(gridW - 1, Math.max(0, Math.floor(fx * scale)));
+    const gy = Math.min(gridH - 1, Math.max(0, Math.floor(fy * scale)));
+    const lbl = labels[gy * gridW + gx];
+    return lbl !== 0 && !labelSet.has(lbl);
+  };
 
   const mask = new Uint8Array(iw * ih);
   for (let ly = 0; ly < bh; ly++) {
@@ -621,6 +824,7 @@ export function extractAndInpaintRgba(baseRgba, fullW, fullH, analysis, target) 
           const nx = gx + dx;
           if (nx < 0 || nx >= iw) continue;
           if (isBoxMode && (nx < boxMinGx || nx > boxMaxGx)) continue;
+          if (!isBoxMode && (dx !== 0 || dy !== 0) && isOtherElementPx(ix0 + nx, iy0 + ny)) continue;
           mask[ny * iw + nx] = 1;
         }
       }
@@ -649,17 +853,35 @@ export function extractAndInpaintRgba(baseRgba, fullW, fullH, analysis, target) 
     for (let y = 0; y < ih; y++) {
       for (let x = 0; x < iw; x++) {
         const idx = y * iw + x;
-        const off = ((iy0 + y) * fullW + (ix0 + x)) * 4;
+        const fx = ix0 + x;
+        const fy = iy0 + y;
+        const off = (fy * fullW + fx) * 4;
         if (mask[idx]) {
-          // 初始默认先填主背景色作保底
-          bufR[idx] = localBg.r;
-          bufG[idx] = localBg.g;
-          bufB[idx] = localBg.b;
+          const [br, bgc, bb] = localBg.at(isBoxMode ? fx : fx * scale, isBoxMode ? fy : fy * scale);
+          bufR[idx] = br;
+          bufG[idx] = bgc;
+          bufB[idx] = bb;
           filled[idx] = 0;
+        } else if (!isBoxMode && isOtherElementPx(fx, fy)) {
+          // 紧邻的另一个未拆元素不能作为背景修补种子，防止串色拉丝
+          const [br, bgc, bb] = localBg.at(fx * scale, fy * scale);
+          bufR[idx] = br;
+          bufG[idx] = bgc;
+          bufB[idx] = bb;
+          filled[idx] = 1;
         } else {
-          bufR[idx] = baseRgba[off];
-          bufG[idx] = baseRgba[off + 1];
-          bufB[idx] = baseRgba[off + 2];
+          const [br, bgc, bb] = localBg.at(isBoxMode ? fx : fx * scale, isBoxMode ? fy : fy * scale);
+          const seedDist = rgbDist(baseRgba[off], baseRgba[off + 1], baseRgba[off + 2], br, bgc, bb);
+          if (!isBoxMode && !localBg.useGradient && seedDist > Math.max(4, (localBg.avgNoise || 2) * 2.2 + 2)) {
+            // 抹除极淡残留外晕像素对背景种子的微弱染色（确保修补后的纯色底图 100% 干净无残影）
+            bufR[idx] = br;
+            bufG[idx] = bgc;
+            bufB[idx] = bb;
+          } else {
+            bufR[idx] = baseRgba[off];
+            bufG[idx] = baseRgba[off + 1];
+            bufB[idx] = baseRgba[off + 2];
+          }
           filled[idx] = 1;
         }
       }

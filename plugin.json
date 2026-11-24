@@ -2,7 +2,7 @@
   "name": "visual-canvas-studio",
   "displayName": "Visual Canvas Studio（纯净预览 / 拆层微调 / PDF 直编）",
   "description": "默认以纯净模式预览图片（PNG/JPG/WebP/GIF/BMP/ICO/AVIF）、SVG、PDF、Markdown 图文文档、HTML 海报与 .canvas.json；点击右上角三个点中的「可视化画布编辑」即可原地切入智能拆层（支持前景与背景底图独立换色、零越界框选抠图）、PDF 原位改字/填表与 DOM 可视化排版。",
-  "version": "2.2.2",
+  "version": "2.2.3",
   "license": "MIT",
   "repository": "https://github.com/tcbhls/visual-canvas-studio",
   "logo": "assets/logo.svg",
