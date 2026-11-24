@@ -1,0 +1,11 @@
+{
+  "vcs-auto-open": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./hooks/auto-open-visual.mjs",
+        "timeout": 10
+      }
+    ]
+  }
+}

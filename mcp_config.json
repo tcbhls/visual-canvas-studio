@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "vcs": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/server/index.mjs",
+        "--data_dir=${PLUGIN_DATA}"
+      ],
+      "tools": {
+        "open_visual_editor": {
+          "eager": true
+        }
+      }
+    }
+  }
+}
