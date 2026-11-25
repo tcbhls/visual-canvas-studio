@@ -570,6 +570,10 @@ function fitPreviewImage() {
   applyPreviewImageZoom(fit);
 }
 
+function getPdfPageImageUrl(pdfData) {
+  return pdfData?.bgDataUrl || pdfData?.imageDataUrl || '';
+}
+
 function applyPreviewPdfZoom(nextZoom) {
   const z = Math.max(0.35, Math.min(3, Number(nextZoom) || 1));
   state.preview.pdfZoom = z;
@@ -581,6 +585,14 @@ function applyPreviewPdfZoom(nextZoom) {
 function fitPreviewPdf() {
   const baseW = state.preview.pdfData?.width || 595;
   const rect = els.previewPdfView.getBoundingClientRect();
+  if (!rect.width) {
+    requestAnimationFrame(() => {
+      const r2 = els.previewPdfView.getBoundingClientRect();
+      const w2 = Math.max(260, (r2.width || window.innerWidth || 720) - 56);
+      applyPreviewPdfZoom(Math.min(w2 / baseW, 1.5));
+    });
+    return;
+  }
   const availW = Math.max(260, rect.width - 56);
   const fit = Math.min(availW / baseW, 1.5);
   applyPreviewPdfZoom(fit);
@@ -599,7 +611,7 @@ function updatePreviewPdfBar() {
 async function previewGoToPdfPage(targetIdx) {
   if (!state.filePath) return;
   const nextIdx = Math.max(0, Math.min(Number(targetIdx) || 0, Math.max(0, state.pdf.pageCount - 1)));
-  if (nextIdx === state.pdf.pageIndex && state.preview.pdfData?.imageDataUrl) {
+  if (nextIdx === state.pdf.pageIndex && getPdfPageImageUrl(state.preview.pdfData)) {
     updatePreviewPdfBar();
     return;
   }
@@ -609,10 +621,14 @@ async function previewGoToPdfPage(targetIdx) {
       pageIndex: nextIdx,
       scale: 2,
     });
+    const pageImgUrl = getPdfPageImageUrl(pageData);
+    if (!pageImgUrl) throw new Error('未返回 PDF 页面预览图像数据');
     state.pdf.pageIndex = pageData.pageIndex;
     state.pdf.pageCount = pageData.pageCount;
     state.preview.pdfData = pageData;
-    els.previewPdfImg.src = pageData.imageDataUrl;
+    state.preview.dataUrl = pageImgUrl;
+    els.previewPdfImg.onload = () => applyPreviewPdfZoom(state.preview.pdfZoom || 1);
+    els.previewPdfImg.src = pageImgUrl;
     updatePreviewPdfBar();
     els.previewPdfView.scrollTop = 0;
   } catch (err) {
@@ -856,10 +872,13 @@ async function returnToPreviewMode() {
     showPreviewSurface('pdf');
     // 若当前页有未保存覆盖层，也直接以当前画布画面作为预览图展示
     const rendered = fabricEngine.exportDataUrl('png', 2);
+    const pdfFallbackUrl = getPdfPageImageUrl(state.preview.pdfData);
     if (rendered) {
       els.previewPdfImg.src = rendered;
-    } else if (state.preview.pdfData?.imageDataUrl) {
-      els.previewPdfImg.src = state.preview.pdfData.imageDataUrl;
+      state.preview.dataUrl = rendered;
+    } else if (pdfFallbackUrl) {
+      els.previewPdfImg.src = pdfFallbackUrl;
+      state.preview.dataUrl = pdfFallbackUrl;
     }
     updatePreviewPdfBar();
     fitPreviewPdf();
@@ -998,6 +1017,10 @@ async function openHostFile(hostFile) {
         name: fileName,
         blobBase64: entry.blob,
       });
+      const pdfImgUrl = getPdfPageImageUrl(pdfData);
+      if (!pdfImgUrl) {
+        throw new Error('PDF 渲染结果缺少页面图像数据');
+      }
       state.filePath = pdfData.filePath;
       state.pdf = {
         pageCount: pdfData.pageCount || 1,
@@ -1006,9 +1029,11 @@ async function openHostFile(hostFile) {
         pageEdits: {},
       };
       state.preview.pdfData = pdfData;
+      state.preview.dataUrl = pdfImgUrl;
       showPreviewSurface('pdf');
       els.previewPdfImg.onload = () => fitPreviewPdf();
-      els.previewPdfImg.src = pdfData.imageDataUrl;
+      els.previewPdfImg.onerror = () => showToast('PDF 页面预览图加载失败', 3200);
+      els.previewPdfImg.src = pdfImgUrl;
       updatePreviewPdfBar();
     } else if (mode === 'markdown') {
       const mdText = entry.text || base64ToUtf8(entry.blob);
@@ -2278,6 +2303,10 @@ els.menuCopyContent.addEventListener('click', async () => {
     if (state.preview.text) {
       await navigator.clipboard.writeText(state.preview.text);
       showToast('已复制文件内容', 1800);
+    } else if (state.preview.mode === 'pdf' && Array.isArray(state.preview.pdfData?.textItems) && state.preview.pdfData.textItems.length) {
+      const pageText = state.preview.pdfData.textItems.map((it) => it.text).filter(Boolean).join('\n');
+      await navigator.clipboard.writeText(pageText);
+      showToast('已复制当前页文字内容', 1800);
     } else if (state.preview.dataUrl && window.ClipboardItem) {
       const resp = await fetch(state.preview.dataUrl);
       const blob = await resp.blob();
@@ -2294,7 +2323,7 @@ els.menuExportImg.addEventListener('click', async () => {
   closePreviewMenu();
   const dataUrl =
     state.preview.mode === 'pdf'
-      ? (state.preview.pdfData?.imageDataUrl || els.previewPdfImg.src)
+      ? (getPdfPageImageUrl(state.preview.pdfData) || els.previewPdfImg.src)
       : state.preview.dataUrl;
   if (!dataUrl) {
     showToast('暂无可导出图片', 2000);
