@@ -36,8 +36,10 @@ import {
   resolve,
 } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as mupdf from 'mupdf';
 import { renderPdfPage, savePdfEdits } from './pdf-engine.mjs';
 import {
+  collectRecentWorkspaces,
   extractConvContext,
   findMostRecentConversation,
   scanConversationContext,
@@ -250,14 +252,188 @@ function listDirectoryVisuals(dirPath, maxDepth = 1) {
   };
 }
 
-function fileToDataUrl(absPath, maxBytes = 8 * 1024 * 1024) {
+/**
+ * 读取任意体积本地图片并安全转为前端 DataURL：
+ * - 普通图片（<= maxRawBytes）：零开销原字节直传
+ * - 超大图（如 16MB+ 4K 无损 PNG，超过 Antigravity 10 MiB resources/read 限制）：
+ *   基于内置 MuPDF 原生 C/WASM 管线按需解码、采样检测真透明通道并输出安全体积图，
+ *   每次调用严格 destroy() 释放 WASM 线性内存，确保多张 4K 巨图并发/连续读取零 OOM。
+ */
+function readImageAsDataUrl(absPath, opts = {}) {
   if (!absPath || !existsSync(absPath)) return null;
   const st = statSync(absPath);
-  if (!st.isFile() || st.size > maxBytes) return null;
+  if (!st.isFile() || st.size === 0) return null;
+
+  const {
+    maxRawBytes = 7.5 * 1024 * 1024,
+    maxOutputBytes = 5.5 * 1024 * 1024,
+    maxDim = 4096,
+    jpegQuality = 92,
+  } = typeof opts === 'number' ? { maxRawBytes: opts } : opts;
+
   const ext = extname(absPath).toLowerCase();
   const mime = IMAGE_MIME[ext] || 'application/octet-stream';
-  const buf = readFileSync(absPath);
-  return `data:${mime};base64,${buf.toString('base64')}`;
+
+  if (ext === '.svg') {
+    if (st.size > 20 * 1024 * 1024) return null;
+    const buf = readFileSync(absPath);
+    return {
+      dataUrl: `data:${mime};base64,${buf.toString('base64')}`,
+      originalBytes: st.size,
+      naturalWidth: 0,
+      naturalHeight: 0,
+      transcoded: false,
+      mime,
+    };
+  }
+
+  if (st.size <= maxRawBytes) {
+    const buf = readFileSync(absPath);
+    return {
+      dataUrl: `data:${mime};base64,${buf.toString('base64')}`,
+      originalBytes: st.size,
+      naturalWidth: 0,
+      naturalHeight: 0,
+      transcoded: false,
+      mime,
+    };
+  }
+
+  // 大图原生 MuPDF WASM 管线转码（突破 10 MiB 限制，支持 4K/8K 几十 MB 原图且严格回收 WASM 内存）
+  const rawBuf = readFileSync(absPath);
+  let img = null;
+  let doc = null;
+  let page = null;
+  try {
+    img = new mupdf.Image(rawBuf);
+    const origW = img.getWidth();
+    const origH = img.getHeight();
+    img.destroy?.();
+    img = null;
+
+    doc = mupdf.Document.openDocument(rawBuf, mime);
+    page = doc.loadPage(0);
+    const bounds = page.getBounds();
+    const ptW = Math.max(1, bounds[2] - bounds[0]);
+    const ptH = Math.max(1, bounds[3] - bounds[1]);
+
+    // 仅对可能带透明通道的格式做 256px 轻量抽样检测，避免分配 64MB 全尺寸 RGBA Pixmap
+    let realTransparent = false;
+    if (ext !== '.jpg' && ext !== '.jpeg') {
+      const probeScale = Math.min(1, 256 / Math.max(ptW, ptH, 1));
+      const probePm = page.toPixmap(
+        mupdf.Matrix.scale(probeScale, probeScale),
+        mupdf.ColorSpace.DeviceRGB,
+        true,
+        true,
+      );
+      try {
+        const px = probePm.getPixels();
+        const comp = probePm.getNumberOfComponents();
+        for (let i = comp - 1; i < px.length; i += comp) {
+          if (px[i] < 252) {
+            realTransparent = true;
+            break;
+          }
+        }
+      } finally {
+        probePm.destroy?.();
+      }
+    }
+
+    const fitScale = Math.min(1, maxDim / Math.max(origW, origH, 1));
+    const renderAt = (pixelScale, withAlpha) => {
+      const targetW = Math.max(1, Math.round(origW * pixelScale));
+      const targetH = Math.max(1, Math.round(origH * pixelScale));
+      return page.toPixmap(
+        mupdf.Matrix.scale(targetW / ptW, targetH / ptH),
+        mupdf.ColorSpace.DeviceRGB,
+        withAlpha,
+        true,
+      );
+    };
+
+    if (!realTransparent) {
+      let pm = renderAt(fitScale, false);
+      let outBuf;
+      try {
+        outBuf = Buffer.from(pm.asJPEG(jpegQuality, false));
+        if (outBuf.length > maxOutputBytes) {
+          outBuf = Buffer.from(pm.asJPEG(Math.min(86, jpegQuality - 6), false));
+        }
+      } finally {
+        pm.destroy?.();
+        pm = null;
+      }
+      if (outBuf.length > maxOutputBytes) {
+        pm = renderAt(fitScale * 0.72, false);
+        try {
+          outBuf = Buffer.from(pm.asJPEG(84, false));
+        } finally {
+          pm.destroy?.();
+          pm = null;
+        }
+      }
+      return {
+        dataUrl: `data:image/jpeg;base64,${outBuf.toString('base64')}`,
+        originalBytes: st.size,
+        naturalWidth: origW,
+        naturalHeight: origH,
+        transcoded: true,
+        mime: 'image/jpeg',
+      };
+    }
+
+    // 真透明通道大图：保留透明并以安全体积输出 PNG
+    let pm = renderAt(fitScale, true);
+    let outPng;
+    try {
+      outPng = Buffer.from(pm.asPNG());
+    } finally {
+      pm.destroy?.();
+      pm = null;
+    }
+    if (outPng.length > maxOutputBytes) {
+      const downScale = Math.min(fitScale * 0.72, 2200 / Math.max(origW, origH, 1));
+      pm = renderAt(downScale, true);
+      try {
+        outPng = Buffer.from(pm.asPNG());
+      } finally {
+        pm.destroy?.();
+        pm = null;
+      }
+    }
+    return {
+      dataUrl: `data:image/png;base64,${outPng.toString('base64')}`,
+      originalBytes: st.size,
+      naturalWidth: origW,
+      naturalHeight: origH,
+      transcoded: true,
+      mime: 'image/png',
+    };
+  } catch {
+    // 非 MuPDF 支持编码（如超大 WebP/AVIF）：放宽上限直接透传
+    if (st.size <= 25 * 1024 * 1024) {
+      return {
+        dataUrl: `data:${mime};base64,${rawBuf.toString('base64')}`,
+        originalBytes: st.size,
+        naturalWidth: 0,
+        naturalHeight: 0,
+        transcoded: false,
+        mime,
+      };
+    }
+    return null;
+  } finally {
+    try { img?.destroy?.(); } catch {}
+    try { page?.destroy?.(); } catch {}
+    try { doc?.destroy?.(); } catch {}
+  }
+}
+
+function fileToDataUrl(absPath, opts = 7.5 * 1024 * 1024) {
+  const res = readImageAsDataUrl(absPath, opts);
+  return res ? res.dataUrl : null;
 }
 
 function resolveAssetPath(baseDir, rawSrc) {
@@ -347,19 +523,41 @@ function collectLocalAssetsFromCanvas(doc, baseDir) {
   return assetMap;
 }
 
+const SKIP_SEARCH_DIRS = new Set([
+  'node_modules',
+  '.git',
+  'dist',
+  'build',
+  '.venv',
+  'venv',
+  '__pycache__',
+  '.system_generated',
+  '.next',
+  '.nuxt',
+  'target',
+  'appdata',
+]);
+
 /**
- * 按文件名在候选目录中快速定位真实磁盘路径（供 Antigravity file 视图匹配资源所在目录与打开位置）
+ * 按文件名在候选目录中快速定位真实磁盘路径（供 Antigravity file 视图匹配资源所在目录、打开位置与超大文件本地回退）
+ * 当提供 expectedBytes 时，若命中文件名且字节数精确相等立即锁定唯一文件；否则返回最近修改的同名文件。
  */
-function findFileByNameInDirs(fileName, searchDirs = [], maxDepth = 3) {
+function findFileByNameInDirs(fileName, searchDirs = [], maxDepth = 4, expectedBytes = 0) {
   if (!fileName) return '';
   const targetLower = basename(fileName).toLowerCase();
   const seenDirs = new Set();
+  const candidates = [];
+  let visitedDirs = 0;
+  const MAX_VISITED_DIRS = 1800;
 
   function walk(dir, depth) {
-    if (!dir || !existsSync(dir)) return '';
+    if (!dir || visitedDirs >= MAX_VISITED_DIRS || !existsSync(dir)) return '';
     const norm = normalize(dir);
-    if (seenDirs.has(norm.toLowerCase())) return '';
-    seenDirs.add(norm.toLowerCase());
+    const dirKey = norm.toLowerCase();
+    if (seenDirs.has(dirKey)) return '';
+    seenDirs.add(dirKey);
+    visitedDirs++;
+
     let entries = [];
     try {
       entries = readdirSync(norm, { withFileTypes: true });
@@ -368,29 +566,131 @@ function findFileByNameInDirs(fileName, searchDirs = [], maxDepth = 3) {
     }
     const subDirs = [];
     for (const ent of entries) {
-      if (ent.name === 'node_modules' || ent.name === '.git' || ent.name === 'dist' || ent.name === '.system_generated') {
-        continue;
-      }
+      const low = ent.name.toLowerCase();
+      if (SKIP_SEARCH_DIRS.has(low)) continue;
       const full = join(norm, ent.name);
-      if (ent.isFile() && ent.name.toLowerCase() === targetLower) {
-        return full;
-      }
-      if (ent.isDirectory() && depth < maxDepth && !ent.name.startsWith('.')) {
+      if (ent.isFile() && low === targetLower) {
+        try {
+          const st = statSync(full);
+          if (expectedBytes > 0 && st.size === expectedBytes) {
+            return full;
+          }
+          candidates.push({ path: full, size: st.size, mtimeMs: st.mtimeMs });
+        } catch {
+          candidates.push({ path: full, size: 0, mtimeMs: 0 });
+        }
+      } else if (ent.isDirectory() && depth < maxDepth && !ent.name.startsWith('.')) {
         subDirs.push(full);
       }
     }
     for (const sub of subDirs) {
-      const hit = walk(sub, depth + 1);
-      if (hit) return hit;
+      const exact = walk(sub, depth + 1);
+      if (exact) return exact;
     }
     return '';
   }
 
   for (const d of searchDirs) {
-    const hit = walk(d, 0);
-    if (hit) return hit;
+    const exact = walk(d, 0);
+    if (exact) return exact;
+    if (!expectedBytes && candidates.length) break;
   }
-  return '';
+
+  if (!candidates.length) return '';
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return candidates[0].path;
+}
+
+/**
+ * 跨会话、跨工作区综合定位 Antigravity file 视图对应的本地真实磁盘路径
+ */
+function findDiskPathForHostFile(fileName, { expectedBytes = 0, extra = null, matchedHint = '', resourceUri = '' } = {}) {
+  let targetName = fileName ? basename(fileName) : '';
+  if (!targetName && resourceUri) {
+    try {
+      const seg = resourceUri.split('/').pop() || '';
+      targetName = basename(decodeURIComponent(seg));
+    } catch {
+      // 忽略
+    }
+  }
+  if (!targetName) return '';
+  const targetLower = targetName.toLowerCase();
+
+  // 1. 优先校验调用方已持有的磁盘路径提示
+  if (matchedHint && existsSync(matchedHint)) {
+    try {
+      const absHint = resolve(matchedHint);
+      const st = statSync(absHint);
+      if (st.isFile() && basename(absHint).toLowerCase() === targetLower) {
+        if (!expectedBytes || st.size === expectedBytes) return absHint;
+      }
+    } catch {
+      // 继续兜底查找
+    }
+  }
+
+  const ctx = extractConvContext(extra);
+  const effectiveCtx = ctx.conversationId ? ctx : findMostRecentConversation();
+  const convScan = scanConversationContext(effectiveCtx.artifactsDir, detectFileMode);
+  const convFiles = convScan.files || [];
+
+  // 2. 当前会话扫描结果直达匹配
+  const convHits = convFiles.filter((f) => f.name.toLowerCase() === targetLower && existsSync(f.path));
+  if (convHits.length) {
+    if (expectedBytes > 0) {
+      const exact = convHits.find((f) => f.size === expectedBytes);
+      if (exact) return exact.path;
+    } else {
+      return convHits[0].path;
+    }
+  }
+
+  // 3. 本地状态历史记录直达匹配
+  const st = loadState();
+  const recentCandidates = [
+    ...(st.recentFiles || []),
+    ...Object.values(st.byConv || {}).flatMap((c) => c?.recentFiles || []),
+  ];
+  for (const rf of recentCandidates) {
+    if (!rf || basename(rf).toLowerCase() !== targetLower || !existsSync(rf)) continue;
+    try {
+      const fst = statSync(rf);
+      if (!expectedBytes || fst.size === expectedBytes) return resolve(rf);
+    } catch {
+      // 忽略
+    }
+  }
+
+  // 4. 汇总所有活跃工作区、近期会话工作区与项目聚合父目录进行有限深度快速搜索
+  const recentWs = collectRecentWorkspaces(20);
+  const uriDirs = [];
+  const uuidMatch = /^antigravity-file:\/\/([0-9a-f-]{16,})\//i.exec(resourceUri || '');
+  if (uuidMatch) {
+    const brainCandidate = join(homedir(), '.gemini', 'antigravity', 'brain', uuidMatch[1]);
+    if (existsSync(brainCandidate)) uriDirs.push(brainCandidate);
+  }
+
+  const primaryDirs = [
+    ...uriDirs,
+    ...(ctx.workspaceDirs || []),
+    effectiveCtx.artifactsDir,
+    convScan.workspaceDir,
+    getDefaultWorkspace(),
+    ...recentWs.workspaces,
+    ...recentWs.artifactDirs,
+  ].filter(Boolean);
+
+  const hitPrimary = findFileByNameInDirs(targetName, primaryDirs, 4, expectedBytes);
+  if (hitPrimary) return hitPrimary;
+
+  // 5. 同级项目聚合目录兜底（例如 D:\antigravity work 下新建的其他项目文件夹）
+  if (recentWs.parentWorkspaces.length) {
+    const hitParent = findFileByNameInDirs(targetName, recentWs.parentWorkspaces, 5, expectedBytes);
+    if (hitParent) return hitParent;
+  }
+
+  return convHits[0]?.path || '';
 }
 
 /**
@@ -400,7 +700,8 @@ function findFileByNameInDirs(fileName, searchDirs = [], maxDepth = 3) {
 function collectLocalAssetsFromMarkdown(markdown, baseDirs = []) {
   const assetMap = {};
   const images = [];
-  const seenDisk = new Set();
+  const diskCache = new Map(); // absLower -> { embeddedUrl, thumbUrl }
+  const seenDisk = new Map(); // absLower -> index in images
   const dirs = baseDirs.filter((d) => d && existsSync(d));
 
   const resolveAcross = (rawSrc) => {
@@ -412,6 +713,39 @@ function collectLocalAssetsFromMarkdown(markdown, baseDirs = []) {
     return resolveAssetPath(process.cwd(), rawSrc);
   };
 
+  const getEmbeddedDataUrl = (abs) => {
+    const key = abs.toLowerCase();
+    const cached = diskCache.get(key) || {};
+    if (cached.embeddedUrl) return cached.embeddedUrl;
+    // Markdown 排版区最大宽 780px，内嵌大图统一转 1280px 高清预览（单图 ~200KB），多张 4K 图同时展示也不超 MCP 传输上限
+    const url =
+      fileToDataUrl(abs, {
+        maxRawBytes: 1.2 * 1024 * 1024,
+        maxOutputBytes: 300 * 1024,
+        maxDim: 1280,
+        jpegQuality: 84,
+      }) || '';
+    cached.embeddedUrl = url;
+    diskCache.set(key, cached);
+    return url;
+  };
+
+  const getThumbDataUrl = (abs) => {
+    const key = abs.toLowerCase();
+    const cached = diskCache.get(key) || {};
+    if (cached.thumbUrl) return cached.thumbUrl;
+    const url =
+      fileToDataUrl(abs, {
+        maxRawBytes: 64 * 1024,
+        maxOutputBytes: 24 * 1024,
+        maxDim: 120,
+        jpegQuality: 74,
+      }) || '';
+    cached.thumbUrl = url;
+    diskCache.set(key, cached);
+    return url;
+  };
+
   const addCandidate = (alt, rawSrc, kind = 'embedded') => {
     if (!rawSrc) return;
     const cleanedSrc = rawSrc.trim().replace(/^<|>$/g, '').replace(/\s+["'][^"']*["']\s*$/, '');
@@ -420,22 +754,32 @@ function collectLocalAssetsFromMarkdown(markdown, baseDirs = []) {
     if (!abs) return;
     const mode = detectFileMode(abs);
     if (mode !== 'image' && mode !== 'svg') return;
-    const dataUrl = assetMap[cleanedSrc] || fileToDataUrl(abs, 12 * 1024 * 1024);
-    if (dataUrl) {
-      assetMap[cleanedSrc] = dataUrl;
-      assetMap[rawSrc] = dataUrl;
-    }
+
     const key = abs.toLowerCase();
+    if (kind === 'embedded') {
+      const dataUrl = getEmbeddedDataUrl(abs);
+      if (dataUrl) {
+        assetMap[cleanedSrc] = dataUrl;
+        if (rawSrc !== cleanedSrc) assetMap[rawSrc] = dataUrl;
+      }
+    }
+
     if (!seenDisk.has(key)) {
-      seenDisk.add(key);
+      seenDisk.set(key, images.length);
       images.push({
         alt: (alt || '').trim() || basename(abs),
         rawSrc: cleanedSrc,
         diskPath: abs,
         fileName: basename(abs),
-        dataUrl: dataUrl || '',
+        // 菜单里仅需极小缩略图（若已在 assetMap 里则前端直接复用，不重复塞整张大图 base64 导致 JSON 体积翻倍）
+        dataUrl: kind === 'embedded' ? '' : getThumbDataUrl(abs),
         kind,
       });
+    } else if (kind === 'embedded') {
+      const existing = images[seenDisk.get(key)];
+      existing.kind = 'embedded';
+      existing.rawSrc = cleanedSrc;
+      existing.dataUrl = '';
     }
   };
 
@@ -535,9 +879,14 @@ function loadVisualFile(filePath, convId = '') {
   }
 
   if (mode === 'image') {
-    const dataUrl = fileToDataUrl(absPath, 15 * 1024 * 1024);
-    if (!dataUrl) {
-      throw new Error(`图片文件过大或无法读取: ${absPath}`);
+    const imgInfo = readImageAsDataUrl(absPath, {
+      maxRawBytes: 6.5 * 1024 * 1024,
+      maxOutputBytes: 4.5 * 1024 * 1024,
+      maxDim: 4096,
+      jpegQuality: 92,
+    });
+    if (!imgInfo?.dataUrl) {
+      throw new Error(`图片文件无法读取或编码不受支持: ${absPath}`);
     }
     return {
       ok: true,
@@ -545,7 +894,11 @@ function loadVisualFile(filePath, convId = '') {
       filePath: absPath,
       fileName,
       dir: baseDir,
-      dataUrl,
+      dataUrl: imgInfo.dataUrl,
+      originalBytes: imgInfo.originalBytes,
+      naturalWidth: imgInfo.naturalWidth,
+      naturalHeight: imgInfo.naturalHeight,
+      transcoded: imgInfo.transcoded,
     };
   }
 
@@ -772,15 +1125,11 @@ registerAppTool(
     const convFiles = convScan.files || [];
     // 依次从本会话视觉列表、本会话 artifacts 目录、工作区目录中匹配真实本地路径，便于解析相对图片与打开所在位置
     let matchedDisk = '';
-    if (file?.name) {
-      const fromConv = convFiles.find((f) => f.name.toLowerCase() === file.name.toLowerCase())?.path || '';
-      matchedDisk =
-        fromConv ||
-        findFileByNameInDirs(file.name, [
-          effectiveCtx.artifactsDir,
-          convScan.workspaceDir,
-          getDefaultWorkspace(),
-        ], 3);
+    if (file?.name || file?.resourceUri) {
+      matchedDisk = findDiskPathForHostFile(file?.name || '', {
+        extra,
+        resourceUri: file?.resourceUri || '',
+      });
     }
 
     return {
@@ -1227,15 +1576,68 @@ registerAppTool(
   async ({ filePath }) => {
     try {
       const abs = resolve(filePath);
-      const dataUrl = fileToDataUrl(abs, 15 * 1024 * 1024);
-      if (!dataUrl) throw new Error(`无法读取图片或体积超过 15MB：${abs}`);
+      const imgInfo = readImageAsDataUrl(abs, {
+        maxRawBytes: 7.5 * 1024 * 1024,
+        maxOutputBytes: 5.5 * 1024 * 1024,
+        maxDim: 4096,
+        jpegQuality: 92,
+      });
+      if (!imgInfo?.dataUrl) throw new Error(`无法读取图片：${abs}`);
       return {
         content: [{ type: 'text', text: `已读取图片 ${basename(abs)}` }],
         structuredContent: {
           ok: true,
           filePath: abs,
           fileName: basename(abs),
-          dataUrl,
+          dataUrl: imgInfo.dataUrl,
+          originalBytes: imgInfo.originalBytes,
+          naturalWidth: imgInfo.naturalWidth,
+          naturalHeight: imgInfo.naturalHeight,
+          transcoded: imgInfo.transcoded,
+        },
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: String(err?.message || err) }],
+      };
+    }
+  },
+);
+
+registerAppTool(
+  server,
+  'app_load_host_fallback',
+  {
+    title: '超大文件本地直读回退',
+    description:
+      'App 内部使用：当 Antigravity 宿主 resources/read 因超过 10 MiB 上限或编码限制失败时，直接按文件名与字节数定位本地磁盘文件并以安全体积载入预览与编辑',
+    inputSchema: z.object({
+      fileName: z.string(),
+      resourceUri: z.string().optional(),
+      expectedBytes: z.number().optional(),
+      matchedDiskPath: z.string().optional(),
+    }),
+    _meta: APP_ONLY_META,
+  },
+  async ({ fileName, resourceUri = '', expectedBytes = 0, matchedDiskPath = '' }, extra) => {
+    try {
+      const convId = extractConvContext(extra).conversationId;
+      const diskPath = findDiskPathForHostFile(fileName, {
+        expectedBytes: Number(expectedBytes) || 0,
+        extra,
+        matchedHint: matchedDiskPath,
+        resourceUri,
+      });
+      if (!diskPath || !existsSync(diskPath)) {
+        throw new Error(`文件超过宿主 10 MiB 限制，且未能在工作区自动定位本地路径：${fileName}`);
+      }
+      const payload = loadVisualFile(diskPath, convId);
+      return {
+        content: [{ type: 'text', text: `已通过本地直读打开大文件：${payload.fileName}` }],
+        structuredContent: {
+          ...payload,
+          loadedViaDiskFallback: true,
         },
       };
     } catch (err) {
@@ -1269,11 +1671,7 @@ registerAppTool(
 
       let resolvedDiskPath = basePath && existsSync(basePath) ? resolve(basePath) : '';
       if (!resolvedDiskPath && fileName) {
-        resolvedDiskPath = findFileByNameInDirs(fileName, [
-          effectiveCtx.artifactsDir,
-          convScan.workspaceDir,
-          getDefaultWorkspace(),
-        ], 3);
+        resolvedDiskPath = findDiskPathForHostFile(fileName, { extra });
       }
 
       const baseDirs = [

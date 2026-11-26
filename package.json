@@ -1,6 +1,6 @@
 {
   "name": "visual-canvas-studio",
-  "version": "2.2.4",
+  "version": "2.2.5",
   "type": "module",
   "description": "Minimalist Antigravity 2.0 native preview & interactive visual editor plugin (offline image layer splitting, background recolor, strict box cutout, multi-page CJK vector PDF editing, Markdown/HTML/SVG/layered canvas).",
   "license": "MIT",

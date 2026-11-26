@@ -122,29 +122,35 @@ export function renderPdfPage(filePath, pageIndex = 0, scale = 2) {
   }
   const pdfBytes = readFileSync(absPath);
   const doc = mupdf.Document.openDocument(pdfBytes, 'application/pdf');
-  const pageCount = doc.countPages();
-  if (pageCount <= 0) {
-    throw new Error('PDF 不包含任何页面');
-  }
-  const safeIndex = Math.max(0, Math.min(Number(pageIndex) || 0, pageCount - 1));
-  const page = doc.loadPage(safeIndex);
-  const bounds = page.getBounds(); // [x0, y0, x1, y1]
-  const width = Math.round((bounds[2] - bounds[0]) * 100) / 100;
-  const height = Math.round((bounds[3] - bounds[1]) * 100) / 100;
+  let page = null;
+  let pixmap = null;
+  let stext = null;
+  try {
+    const pageCount = doc.countPages();
+    if (pageCount <= 0) {
+      throw new Error('PDF 不包含任何页面');
+    }
+    const safeIndex = Math.max(0, Math.min(Number(pageIndex) || 0, pageCount - 1));
+    page = doc.loadPage(safeIndex);
+    const bounds = page.getBounds(); // [x0, y0, x1, y1]
+    const width = Math.round((bounds[2] - bounds[0]) * 100) / 100;
+    const height = Math.round((bounds[3] - bounds[1]) * 100) / 100;
 
-  // 渲染清晰底图（2x Retina）
-  const safeScale = Math.max(1, Math.min(Number(scale) || 2, 3));
-  const pixmap = page.toPixmap(
-    mupdf.Matrix.scale(safeScale, safeScale),
-    mupdf.ColorSpace.DeviceRGB,
-    false,
-    true,
-  );
-  const pngBytes = pixmap.asPNG();
-  const bgDataUrl = `data:image/png;base64,${Buffer.from(pngBytes).toString('base64')}`;
+    // 渲染清晰底图（2x Retina）
+    const safeScale = Math.max(1, Math.min(Number(scale) || 2, 3));
+    pixmap = page.toPixmap(
+      mupdf.Matrix.scale(safeScale, safeScale),
+      mupdf.ColorSpace.DeviceRGB,
+      false,
+      true,
+    );
+    const pngBytes = Buffer.from(pixmap.asPNG());
+    pixmap.destroy?.();
+    pixmap = null;
+    const bgDataUrl = `data:image/png;base64,${pngBytes.toString('base64')}`;
 
-  // 用 st.walk() 精确提取每行文字的真实浮点字号（如 10.5pt）、主中文字体、多数加粗与 RGB 颜色
-  const stext = page.toStructuredText('preserve-whitespace');
+    // 用 st.walk() 精确提取每行文字的真实浮点字号（如 10.5pt）、主中文字体、多数加粗与 RGB 颜色
+    stext = page.toStructuredText('preserve-whitespace');
   const textItems = [];
   const imageItems = [];
   let tSeq = 1;
@@ -232,16 +238,22 @@ export function renderPdfPage(filePath, pageIndex = 0, scale = 2) {
     },
   });
 
-  return {
-    pageIndex: safeIndex,
-    pageCount,
-    width,
-    height,
-    renderScale: safeScale,
-    bgDataUrl,
-    textItems,
-    imageItems,
-  };
+    return {
+      pageIndex: safeIndex,
+      pageCount,
+      width,
+      height,
+      renderScale: safeScale,
+      bgDataUrl,
+      textItems,
+      imageItems,
+    };
+  } finally {
+    try { stext?.destroy?.(); } catch {}
+    try { pixmap?.destroy?.(); } catch {}
+    try { page?.destroy?.(); } catch {}
+    try { doc?.destroy?.(); } catch {}
+  }
 }
 
 /**

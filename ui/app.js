@@ -211,6 +211,7 @@ const state = {
   loadedHostUri: '',
   matchedDiskPath: '',
   openedViaHostFile: false,
+  diskFallback: false, // 超过宿主 10 MiB resources/read 限制时自动切换为本地直读/写回模式
   viewMode: 'edit', // 'preview' | 'edit' | 'source'
   sourceDirty: false,
   mdParentContext: null, // 从 Markdown 预览进入微调其中某张内嵌图片时，记录父文档上下文以便一键返回
@@ -531,7 +532,8 @@ function updatePreviewMenuUi() {
       const btn = document.createElement('button');
       btn.className = 'preview-menu-subitem';
       btn.title = `直接微调：${img.alt || img.fileName}`;
-      const thumb = img.dataUrl ? `<img class="preview-menu-subthumb" src="${img.dataUrl}" alt="" />` : '';
+      const thumbUrl = img.dataUrl || state.preview.assetMap?.[img.rawSrc] || '';
+      const thumb = thumbUrl ? `<img class="preview-menu-subthumb" src="${thumbUrl}" alt="" />` : '';
       const label = img.alt || img.fileName;
       btn.innerHTML = `${thumb}<span class="preview-menu-sublabel">${label}</span>`;
       btn.addEventListener('click', () => enterVisualEditFromPreview(idx));
@@ -913,14 +915,23 @@ function openSourceMode() {
 async function saveSourceFile() {
   const nextText = els.sourceTextarea.value;
   try {
-    if (state.hostFile) {
-      await app.request(
-        {
-          method: 'com.google.antigravity/resources/write',
-          params: { uri: state.hostFile.resourceUri, text: nextText },
-        },
-        ANY_RESULT_SCHEMA,
-      );
+    if (state.hostFile && !state.diskFallback) {
+      try {
+        await app.request(
+          {
+            method: 'com.google.antigravity/resources/write',
+            params: { uri: state.hostFile.resourceUri, text: nextText },
+          },
+          ANY_RESULT_SCHEMA,
+        );
+      } catch (writeErr) {
+        const diskPath = getRevealTargetPath();
+        if (diskPath) {
+          await callServer('app_save_file', { filePath: diskPath, content: nextText });
+        } else {
+          throw writeErr;
+        }
+      }
     } else if (state.filePath) {
       await callServer('app_save_file', { filePath: state.filePath, content: nextText });
     } else {
@@ -937,18 +948,40 @@ async function saveSourceFile() {
 }
 
 // ---------- 核心文件加载 / 保存 / 导出 ----------
+function formatBytesShort(bytes) {
+  const n = Number(bytes) || 0;
+  if (n <= 0) return '';
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
+function extractExpectedBytes(errMsg) {
+  const m = /\bis\s+(\d+)\s+bytes\b/i.exec(String(errMsg || ''));
+  return m ? Number(m[1]) || 0 : 0;
+}
+
 /**
  * Antigravity 原生 file entrypoint 接管流程：
  * 正常点击对话/文件树中的任意文件时，默认进入纯净无打扰预览模式；
- * 点击右上角「⋮ → 可视化画布编辑」即可原地切换为完整交互式微调编辑器。
+ * 当文件超过宿主 resources/read 的 10 MiB 硬上限（如真 4K 无损 PNG、超大 PDF）时，
+ * 自动无缝降级至本地 MCP Server 精准定位原文件并直读，彻底消除 >10MB 文件打不开的问题。
  */
 async function openHostFile(hostFile) {
   if (!hostFile?.resourceUri) return;
   state.loadedHostUri = hostFile.resourceUri;
   state.hostFile = hostFile;
   state.openedViaHostFile = true;
+  state.diskFallback = false;
   state.mdParentContext = null;
-  const fileName = hostFile.name || hostFile.resourceUri.split('/').pop() || '未命名文件';
+  let fileName = hostFile.name || '';
+  if (!fileName) {
+    try {
+      fileName = decodeURIComponent(hostFile.resourceUri.split('/').pop() || '') || '未命名文件';
+    } catch {
+      fileName = hostFile.resourceUri.split('/').pop() || '未命名文件';
+    }
+  }
   const lower = fileName.toLowerCase();
 
   try {
@@ -956,15 +989,121 @@ async function openHostFile(hostFile) {
     els.previewMeta.textContent = '载入中...';
     setViewMode('preview');
 
-    const res = await app.request(
-      { method: 'resources/read', params: { uri: hostFile.resourceUri } },
-      ReadResourceResultSchema,
-    );
-    const entry = res?.contents?.[0];
-    if (!entry || (!entry.blob && !entry.text)) {
-      throw new Error('宿主返回空文件内容（可能超过 10 MiB 限制）');
+    let entry = null;
+    let hostReadErr = null;
+    try {
+      const res = await app.request(
+        { method: 'resources/read', params: { uri: hostFile.resourceUri } },
+        ReadResourceResultSchema,
+      );
+      entry = res?.contents?.[0] || null;
+      if (!entry || (!entry.blob && !entry.text)) {
+        hostReadErr = new Error('宿主返回空文件内容（可能超过 10 MiB 限制）');
+      }
+    } catch (err) {
+      hostReadErr = err;
     }
 
+    // ---------- 路径 A：超过宿主 10 MiB 限制或宿主拒读 → 自动走本地服务端直读回退 ----------
+    if (hostReadErr) {
+      const expectedBytes = extractExpectedBytes(hostReadErr.message);
+      els.previewMeta.textContent = expectedBytes
+        ? `原图 ${formatBytesShort(expectedBytes)}，本地高清直读中...`
+        : '本地直读中...';
+
+      const fb = await callServer('app_load_host_fallback', {
+        fileName,
+        resourceUri: hostFile.resourceUri,
+        expectedBytes,
+        matchedDiskPath: state.matchedDiskPath || '',
+      });
+      if (!fb?.ok) {
+        throw hostReadErr;
+      }
+
+      const mode = fb.mode || 'image';
+      state.mode = mode;
+      state.diskFallback = true;
+      state.fileName = fb.fileName || fileName;
+      state.filePath = fb.filePath;
+      state.matchedDiskPath = fb.filePath;
+      if (fb.dir) state.workspaceDir = fb.dir;
+      state.lastExportPath = fb.document?.lastExportPath || '';
+      state.insertImageMode = false;
+      els.insertImageBanner.classList.add('hidden');
+      els.fileName.textContent = state.fileName;
+      els.fileName.title = fb.filePath;
+
+      state.preview = {
+        mode,
+        fileName: state.fileName,
+        dataUrl: fb.dataUrl || '',
+        text: fb.content || '',
+        assetMap: fb.assetMap || {},
+        images: fb.images || [],
+        pdfData: mode === 'pdf' ? fb : null,
+        pdfZoom: 1,
+        imgZoom: 1,
+        imgNatW: fb.naturalWidth || 0,
+        imgNatH: fb.naturalHeight || 0,
+        canvasDoc: fb.document || null,
+        editorInitialized: false,
+      };
+
+      if (mode === 'image') {
+        const sizeNote = fb.originalBytes ? ` · 原图 ${formatBytesShort(fb.originalBytes)}` : '';
+        const dimLabel =
+          fb.naturalWidth && fb.naturalHeight
+            ? `${fb.naturalWidth} × ${fb.naturalHeight}${sizeNote}`
+            : sizeNote.replace(/^ · /, '');
+        showImageInPreview(fb.dataUrl, dimLabel);
+      } else if (mode === 'svg') {
+        const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(fb.content || '')}`;
+        state.preview.dataUrl = svgUrl;
+        showImageInPreview(svgUrl, 'SVG 矢量图');
+      } else if (mode === 'pdf') {
+        const pdfImgUrl = getPdfPageImageUrl(fb);
+        if (!pdfImgUrl) throw new Error('PDF 渲染结果缺少页面图像数据');
+        state.pdf = {
+          pageCount: fb.pageCount || 1,
+          pageIndex: fb.pageIndex || 0,
+          pickText: true,
+          pageEdits: {},
+        };
+        state.preview.pdfData = fb;
+        state.preview.dataUrl = pdfImgUrl;
+        showPreviewSurface('pdf');
+        els.previewPdfImg.onload = () => fitPreviewPdf();
+        els.previewPdfImg.onerror = () => showToast('PDF 页面预览图加载失败', 3200);
+        els.previewPdfImg.src = pdfImgUrl;
+        updatePreviewPdfBar();
+      } else if (mode === 'markdown') {
+        const h1 = /^#\s+(.+)$/m.exec(fb.content || '');
+        els.previewTitle.textContent = h1 ? h1[1].trim() : state.fileName;
+        showPreviewSurface('markdown');
+        renderMarkdownPreviewContent();
+      } else if (mode === 'html') {
+        els.previewMeta.textContent = 'HTML 预览';
+        showPreviewSurface('html');
+        renderPreviewHtmlShadow(fb.content || '', fb.assetMap || {});
+      } else if (mode === 'canvas') {
+        const doc = fb.document;
+        state.preview.text = JSON.stringify(doc, null, 2);
+        els.previewTitle.textContent = doc?.name || state.fileName;
+        await fabricEngine.loadDocument(doc, fb.assetMap || {});
+        state.preview.editorInitialized = true;
+        const rendered = fabricEngine.exportDataUrl('png', 1);
+        state.preview.dataUrl = rendered;
+        showImageInPreview(rendered, `${doc?.width || 800} × ${doc?.height || 800} · 分层画布`);
+      }
+
+      updateRevealButtons();
+      updatePreviewMenuUi();
+      setDirty(false);
+      return;
+    }
+
+    // ---------- 路径 B：常规 <=10 MiB 文件，直接渲染宿主内容 ----------
     let mode = 'image';
     if (lower.endsWith('.pdf')) mode = 'pdf';
     else if (lower.endsWith('.svg')) mode = 'svg';
@@ -1080,6 +1219,7 @@ async function openFileFromServer(filePath, { keepMdParent = false } = {}) {
     state.hostFile = null;
     state.loadedHostUri = '';
     state.matchedDiskPath = '';
+    state.diskFallback = false;
     if (!keepMdParent) {
       state.mdParentContext = null;
       state.openedViaHostFile = false;
@@ -1317,7 +1457,7 @@ async function savePdfDocument(saveAsNew = false, silent = false) {
 
   try {
     if (!silent) showToast('正在矢量写回 PDF...', 2000);
-    const useHostWrite = Boolean(state.hostFile && !saveAsNew);
+    const useHostWrite = Boolean(state.hostFile && !state.diskFallback && !saveAsNew);
     const res = await callServer('app_save_pdf', {
       filePath: state.filePath,
       outputPath: useHostWrite ? state.filePath : outputPath,
@@ -1392,42 +1532,56 @@ async function saveCurrentFile(silent = false) {
   }
 
   try {
-    // Antigravity 原生 file 视图接管模式：直接通过宿主官方 API 写回当前打开的本地文件
-    if (state.hostFile) {
-      if (state.mode === 'image') {
-        const lower = state.fileName.toLowerCase();
-        const fmt = lower.endsWith('.jpg') || lower.endsWith('.jpeg') ? 'jpeg' : 'png';
-        const dataUrl = fabricEngine.exportDataUrl(fmt, 1);
-        const b64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
-        await app.request(
-          {
-            method: 'com.google.antigravity/resources/write',
-            params: { uri: state.hostFile.resourceUri, blob: b64 },
-          },
-          ANY_RESULT_SCHEMA,
-        );
-      } else {
-        const text = state.mode === 'canvas'
-          ? JSON.stringify(fabricEngine.serialize(), null, 2)
-          : domEngine.serialize();
-        await app.request(
-          {
-            method: 'com.google.antigravity/resources/write',
-            params: { uri: state.hostFile.resourceUri, text },
-          },
-          ANY_RESULT_SCHEMA,
-        );
-      }
-      setDirty(false);
-      if (!silent) {
+    // Antigravity 原生 file 视图接管模式：优先走宿主官方 API；若本就是 >10 MiB 本地回退文件或写回超限，自动落盘写回真实路径
+    if (state.hostFile && !state.diskFallback) {
+      let hostWriteFallback = false;
+      try {
+        if (state.mode === 'image') {
+          const lower = state.fileName.toLowerCase();
+          const fmt = lower.endsWith('.jpg') || lower.endsWith('.jpeg') ? 'jpeg' : 'png';
+          const dataUrl = fabricEngine.exportDataUrl(fmt, 1);
+          const b64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
+          await app.request(
+            {
+              method: 'com.google.antigravity/resources/write',
+              params: { uri: state.hostFile.resourceUri, blob: b64 },
+            },
+            ANY_RESULT_SCHEMA,
+          );
+        } else {
+          const text = state.mode === 'canvas'
+            ? JSON.stringify(fabricEngine.serialize(), null, 2)
+            : domEngine.serialize();
+          await app.request(
+            {
+              method: 'com.google.antigravity/resources/write',
+              params: { uri: state.hostFile.resourceUri, text },
+            },
+            ANY_RESULT_SCHEMA,
+          );
+        }
+      } catch (writeErr) {
         const revPath = getRevealTargetPath();
-        showToast(
-          `已直接保存回 ${state.fileName}`,
-          3600,
-          revPath ? { label: '打开所在位置', onClick: () => revealInExplorer(revPath, false) } : null,
-        );
+        if (revPath) {
+          state.filePath = revPath;
+          state.diskFallback = true;
+          hostWriteFallback = true;
+        } else {
+          throw writeErr;
+        }
       }
-      return { ok: true };
+      if (!hostWriteFallback) {
+        setDirty(false);
+        if (!silent) {
+          const revPath = getRevealTargetPath();
+          showToast(
+            `已直接保存回 ${state.fileName}`,
+            3600,
+            revPath ? { label: '打开所在位置', onClick: () => revealInExplorer(revPath, false) } : null,
+          );
+        }
+        return { ok: true };
+      }
     }
 
     let targetPath = state.filePath;

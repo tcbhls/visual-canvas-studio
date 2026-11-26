@@ -6,7 +6,8 @@
  */
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, extname, join, normalize } from 'node:path';
+import { basename, dirname, extname, join, normalize, parse } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const VISUAL_EXTS = new Set([
   '.pdf',
@@ -32,6 +33,20 @@ export function isVisualPath(p) {
   return l.endsWith('.canvas.json') || l.endsWith('.vcs.json') || VISUAL_EXTS.has(extname(l));
 }
 
+function uriToLocalPath(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let s = raw.trim();
+  if (!s) return '';
+  if (s.startsWith('file://')) {
+    try {
+      s = fileURLToPath(s);
+    } catch {
+      s = decodeURIComponent(s.replace(/^file:\/\/\/?/i, ''));
+    }
+  }
+  return normalize(s);
+}
+
 export function extractConvContext(extra) {
   const meta = extra?._meta || {};
   const convId =
@@ -43,10 +58,103 @@ export function extractConvContext(extra) {
     const candidate = join(DEFAULT_BRAIN_ROOT, convId);
     if (existsSync(candidate)) artifactsDir = candidate;
   }
+  const workspaceDirs = [];
+  const rawWs = meta['antigravity.google/workspace_uris'] || meta['antigravity.google/workspace_dir'] || [];
+  const wsList = Array.isArray(rawWs) ? rawWs : [rawWs];
+  for (const item of wsList) {
+    const p = uriToLocalPath(item);
+    if (p && existsSync(p)) workspaceDirs.push(p);
+  }
   return {
     conversationId: String(convId || ''),
     artifactsDir: artifactsDir ? normalize(artifactsDir) : '',
+    workspaceDirs,
   };
+}
+
+/**
+ * 扫描最近活跃的多个 Antigravity 会话，聚合所有出现过的工作区根目录与聚合父目录，
+ * 解决跨工作区打开大文件或相对路径图片时定位不到磁盘原文件的问题。
+ */
+export function collectRecentWorkspaces(maxConvs = 20) {
+  const workspaces = [];
+  const artifactDirs = [];
+  const parentWorkspaces = [];
+  const seenWs = new Set();
+  const seenParents = new Set();
+  const homeLower = normalize(homedir()).toLowerCase();
+
+  const addWs = (raw) => {
+    const p = uriToLocalPath(raw);
+    if (!p || !existsSync(p)) return;
+    const low = p.toLowerCase();
+    if (!seenWs.has(low)) {
+      seenWs.add(low);
+      workspaces.push(p);
+    }
+    const parent = dirname(p);
+    if (parent && parent !== p) {
+      const pLow = parent.toLowerCase();
+      const rootLow = parse(parent).root.toLowerCase();
+      // 仅纳入类似 D:\antigravity work 这类项目聚合目录，避开盘符根目录与用户主目录
+      if (pLow !== rootLow && pLow !== homeLower && !pLow.endsWith(':\\users') && !seenParents.has(pLow)) {
+        seenParents.add(pLow);
+        parentWorkspaces.push(parent);
+      }
+    }
+  };
+
+  if (!existsSync(DEFAULT_BRAIN_ROOT)) {
+    return { workspaces, parentWorkspaces, artifactDirs };
+  }
+
+  const convs = [];
+  try {
+    for (const ent of readdirSync(DEFAULT_BRAIN_ROOT, { withFileTypes: true })) {
+      if (!ent.isDirectory() || !/^[0-9a-f-]{16,}$/i.test(ent.name)) continue;
+      const dir = join(DEFAULT_BRAIN_ROOT, ent.name);
+      const tx = join(dir, '.system_generated', 'logs', 'transcript.jsonl');
+      let mtime = 0;
+      try {
+        mtime = existsSync(tx) ? statSync(tx).mtimeMs : statSync(dir).mtimeMs;
+      } catch {
+        continue;
+      }
+      convs.push({ dir, tx, mtime });
+    }
+  } catch {
+    return { workspaces, parentWorkspaces, artifactDirs };
+  }
+
+  convs.sort((a, b) => b.mtime - a.mtime);
+  for (const c of convs.slice(0, maxConvs)) {
+    artifactDirs.push(c.dir);
+    if (!existsSync(c.tx)) continue;
+    try {
+      const fd = openSync(c.tx, 'r');
+      let head = '';
+      try {
+        const buf = Buffer.alloc(16384);
+        const bytesRead = readSync(fd, buf, 0, buf.length, 0);
+        head = buf.slice(0, bytesRead).toString('utf-8');
+      } finally {
+        closeSync(fd);
+      }
+      const blockMatch = /Active Workspaces:\s*(?:\\n|[\r\n])+([\s\S]{1,1200}?)(?:Command Working Directory:|App Data Directory:|\\n\\n|\r?\n\r?\n)/i.exec(head);
+      if (blockMatch) {
+        const cleanBlock = blockMatch[1].replace(/\\r\\n|\\n/g, '\n').replace(/\\\\/g, '\\');
+        const lineRe = /^\s*-\s*([A-Za-z]:[^\r\n"]+|\/[^\r\n"]+)/gm;
+        let m;
+        while ((m = lineRe.exec(cleanBlock)) !== null) {
+          addWs(m[1].trim());
+        }
+      }
+    } catch {
+      // 忽略单个日志读取失败
+    }
+  }
+
+  return { workspaces, parentWorkspaces, artifactDirs };
 }
 
 /**
