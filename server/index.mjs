@@ -22,6 +22,7 @@ import {
   readdirSync,
   readFileSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -1876,6 +1877,85 @@ registerAppTool(
       return {
         content: [{ type: 'text', text: `已保存 PDF 至 ${res.outputPath}` }],
         structuredContent: payload,
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: String(err?.message || err) }],
+      };
+    }
+  },
+);
+
+registerAppTool(
+  server,
+  'app_save_review_crops',
+  {
+    title: '保存圈选评论标注图与局部裁剪图',
+    description: 'App 内部使用：将预览页圈选评论生成的带编号红框总览图与各选区局部高清裁剪图落盘，供对话中的 AI 精准查看定位',
+    inputSchema: z.object({
+      sourceFileName: z.string().optional(),
+      overviewDataUrl: z.string().optional(),
+      crops: z
+        .array(
+          z.object({
+            index: z.number().int().min(1),
+            dataUrl: z.string(),
+          }),
+        )
+        .optional(),
+    }),
+    _meta: APP_ONLY_META,
+  },
+  async ({ sourceFileName = 'image', overviewDataUrl = '', crops = [] }) => {
+    try {
+      const reviewDir = join(DATA_DIR, 'review_comments');
+      ensureDir(reviewDir);
+      // 自动清理超过 48 小时的旧临时评论图，避免插件数据目录膨胀
+      const now = Date.now();
+      try {
+        for (const ent of readdirSync(reviewDir, { withFileTypes: true })) {
+          if (!ent.isFile()) continue;
+          const p = join(reviewDir, ent.name);
+          try {
+            if (now - statSync(p).mtimeMs > 48 * 3600 * 1000) unlinkSync(p);
+          } catch {
+            // 忽略单个清理失败
+          }
+        }
+      } catch {
+        // 忽略扫描异常
+      }
+
+      const safeBase = basename(sourceFileName || 'image')
+        .replace(/\.[^.]+$/, '')
+        .replace(/[<>:"/\\|?*\s]+/g, '_')
+        .slice(0, 40) || 'image';
+      const stamp = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+
+      const writeDataUrl = (dataUrl, suffix) => {
+        const m = /^data:image\/(png|jpe?g|webp);base64,(.+)$/i.exec(dataUrl || '');
+        if (!m) return '';
+        const ext = m[1].toLowerCase().startsWith('jp') ? 'jpg' : m[1].toLowerCase();
+        const outPath = join(reviewDir, `${safeBase}_${stamp}_${suffix}.${ext}`);
+        writeFileSync(outPath, Buffer.from(m[2], 'base64'));
+        return outPath;
+      };
+
+      const overviewPath = overviewDataUrl ? writeDataUrl(overviewDataUrl, 'overview') : '';
+      const cropPaths = [];
+      for (const item of crops || []) {
+        const p = writeDataUrl(item.dataUrl, `region${item.index}`);
+        if (p) cropPaths.push({ index: item.index, path: p });
+      }
+
+      return {
+        content: [{ type: 'text', text: `已保存圈选评论标注图（${cropPaths.length} 个选区）` }],
+        structuredContent: {
+          ok: true,
+          overviewPath,
+          cropPaths,
+        },
       };
     } catch (err) {
       return {

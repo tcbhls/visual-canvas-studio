@@ -1683,11 +1683,12 @@ input[type="color"]::-webkit-color-swatch {
 
 .preview-img-canvas {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   min-width: 100%;
   min-height: 100%;
-  padding: 28px 28px 68px;
+  padding: 36px 28px 68px;
 }
 
 .preview-img-el {
@@ -1697,11 +1698,11 @@ input[type="color"]::-webkit-color-swatch {
   border-radius: 4px;
   box-shadow: var(--shadow-art);
   transition: width 0.08s ease;
-  cursor: zoom-in;
+  cursor: crosshair;
 }
 
 .preview-img-el.zoomed {
-  cursor: grab;
+  cursor: crosshair;
 }
 
 .preview-pdf-view {
@@ -1717,7 +1718,7 @@ input[type="color"]::-webkit-color-swatch {
   justify-content: center;
   align-items: flex-start;
   min-height: 100%;
-  padding: 24px 24px 72px;
+  padding: 34px 24px 72px;
 }
 
 .preview-pdf-img {
@@ -1726,6 +1727,281 @@ input[type="color"]::-webkit-color-swatch {
   border-radius: 3px;
   box-shadow: var(--shadow-art);
   max-width: none;
+  cursor: crosshair;
+}
+
+/* 原生感极简圈选评论覆盖层与浮动气泡 */
+.preview-comment-hint {
+  position: fixed;
+  top: 44px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 12;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--ink-3);
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.preview-annot-stage {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+  cursor: crosshair;
+  user-select: none;
+}
+
+.preview-annot-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 8;
+}
+
+.annot-draft {
+  position: absolute;
+  border: 1.5px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+.annot-draft-dim {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: rgba(17, 19, 24, 0.86);
+  color: #ffffff;
+  font-size: 10.5px;
+  line-height: 1.2;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.annot-box {
+  position: absolute;
+  border: 1.8px solid var(--accent);
+  background: rgba(37, 99, 235, 0.1);
+  border-radius: 4px;
+  box-sizing: border-box;
+  pointer-events: auto;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.annot-box:hover,
+.annot-box.active {
+  background: rgba(37, 99, 235, 0.18);
+  border-color: #1d4ed8;
+}
+
+.annot-badge {
+  position: absolute;
+  top: -10px;
+  left: -10px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--primary-bg);
+  color: var(--primary-fg);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 20px;
+  text-align: center;
+  box-shadow: var(--shadow-sm);
+  pointer-events: auto;
+}
+
+.annot-tip {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 5px);
+  max-width: 220px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: var(--bg-elevated);
+  color: var(--ink-1);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--shadow-sm);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.annot-box:hover .annot-tip {
+  opacity: 1;
+}
+
+.pfloat-comment-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.pfloat-comment-count {
+  font-size: 11px;
+  color: var(--ink-2);
+  padding: 0 2px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.pfloat-send-btn {
+  height: 22px;
+  padding: 0 9px;
+  border: none;
+  border-radius: 999px;
+  background: var(--primary-bg);
+  color: var(--primary-fg);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.12s ease;
+}
+
+.pfloat-send-btn:hover {
+  opacity: 0.88;
+}
+
+.pcomment-popover {
+  position: fixed;
+  z-index: 300;
+  width: 288px;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pcomment-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pcomment-title {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pcomment-close {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-3);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.pcomment-close:hover {
+  background: var(--bg-hover);
+  color: var(--ink-1);
+}
+
+.pcomment-input {
+  width: 100%;
+  min-height: 54px;
+  max-height: 140px;
+  resize: vertical;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: var(--bg-subtle);
+  color: var(--ink-1);
+  font-family: var(--font);
+  font-size: 12.5px;
+  line-height: 1.5;
+  outline: none;
+  user-select: text;
+}
+
+.pcomment-input:focus {
+  border-color: var(--accent);
+  background: var(--bg-page);
+}
+
+.pcomment-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pcomment-foot-spacer {
+  flex: 1;
+}
+
+.pcomment-del-btn {
+  height: 26px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.pcomment-del-btn:hover {
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.pcomment-sec-btn {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-1);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.pcomment-sec-btn:hover {
+  background: var(--bg-hover);
+}
+
+.pcomment-pri-btn {
+  height: 26px;
+  padding: 0 11px;
+  border: none;
+  border-radius: 7px;
+  background: var(--primary-bg);
+  color: var(--primary-fg);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.pcomment-pri-btn:hover {
+  opacity: 0.9;
 }
 
 .preview-float-bar {

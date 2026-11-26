@@ -66,14 +66,22 @@ const els = {
   previewBody: $('preview-body'),
   previewImageView: $('preview-image-view'),
   previewImgCanvas: $('preview-img-canvas'),
+  previewImgStage: $('preview-img-stage'),
   previewImgEl: $('preview-img-el'),
+  previewImgAnnot: $('preview-img-annot'),
   btnPimgOut: $('btn-pimg-out'),
   btnPimgFit: $('btn-pimg-fit'),
   btnPimgIn: $('btn-pimg-in'),
   lblPimgDim: $('lbl-pimg-dim'),
+  pimgCommentGroup: $('pimg-comment-group'),
+  lblPimgComments: $('lbl-pimg-comments'),
+  btnPimgSendComments: $('btn-pimg-send-comments'),
+  btnPimgClearComments: $('btn-pimg-clear-comments'),
   previewPdfView: $('preview-pdf-view'),
   previewPdfScroll: $('preview-pdf-scroll'),
+  previewPdfStage: $('preview-pdf-stage'),
   previewPdfImg: $('preview-pdf-img'),
+  previewPdfAnnot: $('preview-pdf-annot'),
   btnPpdfPrev: $('btn-ppdf-prev'),
   inpPpdfPage: $('inp-ppdf-page'),
   lblPpdfTotal: $('lbl-ppdf-total'),
@@ -81,10 +89,21 @@ const els = {
   btnPpdfOut: $('btn-ppdf-out'),
   btnPpdfFit: $('btn-ppdf-fit'),
   btnPpdfIn: $('btn-ppdf-in'),
+  ppdfCommentGroup: $('ppdf-comment-group'),
+  lblPpdfComments: $('lbl-ppdf-comments'),
+  btnPpdfSendComments: $('btn-ppdf-send-comments'),
+  btnPpdfClearComments: $('btn-ppdf-clear-comments'),
   previewMdView: $('preview-md-view'),
   previewMdArticle: $('preview-md-article'),
   previewHtmlView: $('preview-html-view'),
   previewHtmlHost: $('preview-html-host'),
+  previewCommentPopover: $('preview-comment-popover'),
+  pcommentTitle: $('pcomment-title'),
+  btnPcommentClose: $('btn-pcomment-close'),
+  inpPcommentText: $('inp-pcomment-text'),
+  btnPcommentDelete: $('btn-pcomment-delete'),
+  btnPcommentSave: $('btn-pcomment-save'),
+  btnPcommentSend: $('btn-pcomment-send'),
   sourceShell: $('source-shell'),
   btnSourceBack: $('btn-source-back'),
   sourceFileName: $('source-file-name'),
@@ -227,9 +246,13 @@ const state = {
     imgZoom: 1,
     imgNatW: 0,
     imgNatH: 0,
+    imgOrigW: 0,
+    imgOrigH: 0,
     canvasDoc: null,
     editorInitialized: false,
   },
+  previewComments: [], // 纯净预览拖拽圈选的区域评论列表
+  activeCommentDraft: null, // 当前正在输入/编辑的区域选框草稿
   mode: 'none', // 'none' | 'canvas' | 'image' | 'pdf' | 'html' | 'svg' | 'markdown'
   filePath: '',
   fileName: '',
@@ -476,6 +499,7 @@ function togglePreviewMenu() {
 function setViewMode(nextMode) {
   state.viewMode = nextMode;
   closePreviewMenu();
+  if (nextMode !== 'preview') closeCommentPopover();
   els.appShell.classList.toggle('is-preview', nextMode === 'preview');
   els.appShell.classList.toggle('is-source', nextMode === 'source');
   els.previewShell.classList.toggle('hidden', nextMode !== 'preview');
@@ -632,6 +656,8 @@ async function previewGoToPdfPage(targetIdx) {
     els.previewPdfImg.onload = () => applyPreviewPdfZoom(state.preview.pdfZoom || 1);
     els.previewPdfImg.src = pageImgUrl;
     updatePreviewPdfBar();
+    closeCommentPopover();
+    renderPreviewCommentOverlays();
     els.previewPdfView.scrollTop = 0;
   } catch (err) {
     showToast(`翻页失败: ${err.message}`, 3000);
@@ -974,6 +1000,7 @@ async function openHostFile(hostFile) {
   state.openedViaHostFile = true;
   state.diskFallback = false;
   state.mdParentContext = null;
+  clearPreviewComments({ silent: true });
   let fileName = hostFile.name || '';
   if (!fileName) {
     try {
@@ -1046,6 +1073,8 @@ async function openHostFile(hostFile) {
         imgZoom: 1,
         imgNatW: fb.naturalWidth || 0,
         imgNatH: fb.naturalHeight || 0,
+        imgOrigW: fb.naturalWidth || 0,
+        imgOrigH: fb.naturalHeight || 0,
         canvasDoc: fb.document || null,
         editorInitialized: false,
       };
@@ -1132,6 +1161,8 @@ async function openHostFile(hostFile) {
       imgZoom: 1,
       imgNatW: 0,
       imgNatH: 0,
+      imgOrigW: 0,
+      imgOrigH: 0,
       canvasDoc: null,
       editorInitialized: false,
     };
@@ -1220,6 +1251,7 @@ async function openFileFromServer(filePath, { keepMdParent = false } = {}) {
     state.loadedHostUri = '';
     state.matchedDiskPath = '';
     state.diskFallback = false;
+    clearPreviewComments({ silent: true });
     if (!keepMdParent) {
       state.mdParentContext = null;
       state.openedViaHostFile = false;
@@ -2605,10 +2637,599 @@ window.addEventListener('resize', () => {
   if (state.viewMode === 'edit' && getActiveEngine()) fitCurrentStage();
 });
 
+// ---------- 纯净预览：原生式拖拽圈选局部区域评论（图片 / SVG / 分层画布 / PDF） ----------
+function getPreviewTrueDims(kind) {
+  if (kind === 'pdf') {
+    const w = Math.round(state.preview.pdfData?.width || 595);
+    const h = Math.round(state.preview.pdfData?.height || 842);
+    return { w, h, unit: 'pt' };
+  }
+  const w = state.preview.imgOrigW || state.preview.imgNatW || els.previewImgEl.naturalWidth || 1000;
+  const h = state.preview.imgOrigH || state.preview.imgNatH || els.previewImgEl.naturalHeight || 1000;
+  return { w, h, unit: 'px' };
+}
+
+function getPreviewAnnotEls(kind) {
+  return kind === 'pdf'
+    ? { stage: els.previewPdfStage, img: els.previewPdfImg, layer: els.previewPdfAnnot }
+    : { stage: els.previewImgStage, img: els.previewImgEl, layer: els.previewImgAnnot };
+}
+
+function computeRegionCoords(kind, x, y, w, h) {
+  const { w: baseW, h: baseH } = getPreviewTrueDims(kind);
+  return {
+    px: Math.max(0, Math.round(x * baseW)),
+    py: Math.max(0, Math.round(y * baseH)),
+    pw: Math.max(1, Math.round(w * baseW)),
+    ph: Math.max(1, Math.round(h * baseH)),
+  };
+}
+
+function captureRegionCropDataUrl(imgEl, box) {
+  try {
+    const natW = imgEl?.naturalWidth || 0;
+    const natH = imgEl?.naturalHeight || 0;
+    if (!natW || !natH) return '';
+    // 四周外扩 6% 上下文边距，便于 AI 看清局部周边参照
+    const padX = Math.max(0.02, box.w * 0.12);
+    const padY = Math.max(0.02, box.h * 0.12);
+    const x0 = Math.max(0, Math.floor((box.x - padX) * natW));
+    const y0 = Math.max(0, Math.floor((box.y - padY) * natH));
+    const x1 = Math.min(natW, Math.ceil((box.x + box.w + padX) * natW));
+    const y1 = Math.min(natH, Math.ceil((box.y + box.h + padY) * natH));
+    const cw = Math.max(1, x1 - x0);
+    const ch = Math.max(1, y1 - y0);
+    const scale = Math.min(1, 1024 / Math.max(cw, ch));
+    const outW = Math.max(1, Math.round(cw * scale));
+    const outH = Math.max(1, Math.round(ch * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(imgEl, x0, y0, cw, ch, 0, 0, outW, outH);
+
+    // 在局部放大图上同步画细红框标出精确目标子区域
+    const rx = (box.x * natW - x0) * scale;
+    const ry = (box.y * natH - y0) * scale;
+    const rw = box.w * natW * scale;
+    const rh = box.h * natH * scale;
+    ctx.strokeStyle = '#ef4444';
+    ctx.lineWidth = Math.max(2, Math.round(Math.min(outW, outH) * 0.005));
+    ctx.strokeRect(rx, ry, rw, rh);
+
+    return canvas.toDataURL('image/jpeg', 0.9);
+  } catch {
+    return '';
+  }
+}
+
+function buildAnnotatedOverviewDataUrl(kind, comments) {
+  try {
+    const { img } = getPreviewAnnotEls(kind);
+    const natW = img?.naturalWidth || 0;
+    const natH = img?.naturalHeight || 0;
+    if (!natW || !natH) return '';
+    const pageNow = kind === 'pdf' ? state.pdf.pageIndex : 0;
+    const visible = comments.filter((c) => c.kind === kind && c.pageIndex === pageNow);
+    if (!visible.length) return '';
+
+    const scale = Math.min(1, 1400 / Math.max(natW, natH));
+    const outW = Math.max(1, Math.round(natW * scale));
+    const outH = Math.max(1, Math.round(natH * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, outW, outH);
+
+    const strokeW = Math.max(3, Math.round(Math.min(outW, outH) * 0.004));
+    const badgeR = Math.max(13, Math.round(Math.min(outW, outH) * 0.017));
+
+    visible.forEach((c) => {
+      const idx = comments.indexOf(c) + 1;
+      const rx = c.x * outW;
+      const ry = c.y * outH;
+      const rw = c.w * outW;
+      const rh = c.h * outH;
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.12)';
+      ctx.fillRect(rx, ry, rw, rh);
+      ctx.strokeStyle = '#ef4444';
+      ctx.lineWidth = strokeW;
+      ctx.strokeRect(rx, ry, rw, rh);
+
+      const bx = Math.max(badgeR + 2, Math.min(outW - badgeR - 2, rx));
+      const by = Math.max(badgeR + 2, Math.min(outH - badgeR - 2, ry));
+      ctx.beginPath();
+      ctx.arc(bx, by, badgeR, 0, Math.PI * 2);
+      ctx.fillStyle = '#ef4444';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `bold ${Math.round(badgeR * 1.08)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(idx), bx, by + 0.5);
+    });
+
+    return canvas.toDataURL('image/jpeg', 0.88);
+  } catch {
+    return '';
+  }
+}
+
+function updatePreviewCommentBarUi() {
+  const total = state.previewComments.length;
+  const label = `${total} 条评论`;
+  els.pimgCommentGroup.classList.toggle('hidden', total === 0);
+  els.lblPimgComments.textContent = label;
+  els.ppdfCommentGroup.classList.toggle('hidden', total === 0);
+  els.lblPpdfComments.textContent = label;
+}
+
+function renderPreviewCommentOverlays() {
+  const renderFor = (kind) => {
+    const { layer } = getPreviewAnnotEls(kind);
+    if (!layer) return;
+    layer.innerHTML = '';
+    const pageNow = kind === 'pdf' ? state.pdf.pageIndex : 0;
+
+    state.previewComments.forEach((c, idx) => {
+      if (c.kind !== kind || c.pageIndex !== pageNow) return;
+      const box = document.createElement('div');
+      box.className = 'annot-box';
+      if (state.activeCommentDraft?.mode === 'edit' && state.activeCommentDraft.id === c.id) {
+        box.classList.add('active');
+      }
+      box.style.left = `${(c.x * 100).toFixed(4)}%`;
+      box.style.top = `${(c.y * 100).toFixed(4)}%`;
+      box.style.width = `${(c.w * 100).toFixed(4)}%`;
+      box.style.height = `${(c.h * 100).toFixed(4)}%`;
+
+      const badge = document.createElement('span');
+      badge.className = 'annot-badge';
+      badge.textContent = String(idx + 1);
+      box.appendChild(badge);
+
+      if (c.text) {
+        const tip = document.createElement('div');
+        tip.className = 'annot-tip';
+        tip.textContent = c.text;
+        box.appendChild(tip);
+      }
+
+      box.addEventListener('pointerdown', (e) => e.stopPropagation());
+      box.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openCommentPopoverForEdit(c, box.getBoundingClientRect());
+      });
+      layer.appendChild(box);
+    });
+
+    // 若当前正在新建选框草稿，渲染临时高亮框
+    const draft = state.activeCommentDraft;
+    if (draft && draft.mode === 'create' && draft.kind === kind && draft.pageIndex === pageNow) {
+      const box = document.createElement('div');
+      box.className = 'annot-draft';
+      box.style.left = `${(draft.x * 100).toFixed(4)}%`;
+      box.style.top = `${(draft.y * 100).toFixed(4)}%`;
+      box.style.width = `${(draft.w * 100).toFixed(4)}%`;
+      box.style.height = `${(draft.h * 100).toFixed(4)}%`;
+      layer.appendChild(box);
+    }
+  };
+
+  renderFor('image');
+  renderFor('pdf');
+  updatePreviewCommentBarUi();
+}
+
+function positionCommentPopover(anchorRect) {
+  const pop = els.previewCommentPopover;
+  pop.classList.remove('hidden');
+  const popW = pop.offsetWidth || 288;
+  const popH = pop.offsetHeight || 148;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const pad = 12;
+
+  let left = anchorRect.left;
+  let top = anchorRect.bottom + 10;
+  if (top + popH > vh - 58) {
+    top = anchorRect.top - popH - 10;
+  }
+  if (top < 46) {
+    top = Math.max(46, Math.min(vh - popH - 58, anchorRect.top + 8));
+  }
+  if (left + popW > vw - pad) {
+    left = vw - popW - pad;
+  }
+  if (left < pad) left = pad;
+
+  pop.style.left = `${Math.round(left)}px`;
+  pop.style.top = `${Math.round(top)}px`;
+}
+
+function closeCommentPopover() {
+  state.activeCommentDraft = null;
+  els.previewCommentPopover.classList.add('hidden');
+  renderPreviewCommentOverlays();
+}
+
+function openCommentPopoverForCreate(kind, rectNorm, anchorRect) {
+  const pageIndex = kind === 'pdf' ? state.pdf.pageIndex : 0;
+  const coords = computeRegionCoords(kind, rectNorm.x, rectNorm.y, rectNorm.w, rectNorm.h);
+  const nextNum = state.previewComments.length + 1;
+  const { unit } = getPreviewTrueDims(kind);
+  const pageTag = kind === 'pdf' ? `第 ${pageIndex + 1} 页 · ` : '';
+
+  state.activeCommentDraft = {
+    mode: 'create',
+    id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    kind,
+    pageIndex,
+    ...rectNorm,
+    ...coords,
+  };
+  els.pcommentTitle.textContent = `区域 #${nextNum} · ${pageTag}${coords.pw}×${coords.ph} ${unit}`;
+  els.inpPcommentText.value = '';
+  els.btnPcommentDelete.classList.add('hidden');
+  els.btnPcommentSave.textContent = '添加评论';
+  renderPreviewCommentOverlays();
+  positionCommentPopover(anchorRect);
+  setTimeout(() => els.inpPcommentText.focus(), 10);
+}
+
+function openCommentPopoverForEdit(comment, anchorRect) {
+  const idx = state.previewComments.indexOf(comment) + 1;
+  const { unit } = getPreviewTrueDims(comment.kind);
+  const pageTag = comment.kind === 'pdf' ? `第 ${comment.pageIndex + 1} 页 · ` : '';
+
+  state.activeCommentDraft = {
+    mode: 'edit',
+    ...comment,
+  };
+  els.pcommentTitle.textContent = `区域 #${idx} · ${pageTag}${comment.pw}×${comment.ph} ${unit}`;
+  els.inpPcommentText.value = comment.text || '';
+  els.btnPcommentDelete.classList.remove('hidden');
+  els.btnPcommentSave.textContent = '更新评论';
+  renderPreviewCommentOverlays();
+  positionCommentPopover(anchorRect);
+  setTimeout(() => {
+    els.inpPcommentText.focus();
+    els.inpPcommentText.select();
+  }, 10);
+}
+
+async function persistReviewCropsAndFormat(comments) {
+  if (!comments.length) return '';
+  const targetPath = getRevealTargetPath() || state.filePath || state.fileName || '当前文件';
+  const kind = comments[0].kind;
+  const { w: baseW, h: baseH, unit } = getPreviewTrueDims(kind);
+
+  let overviewPath = '';
+  const cropPathMap = new Map();
+  if (state.connected) {
+    try {
+      const overviewDataUrl = buildAnnotatedOverviewDataUrl(kind, comments);
+      const crops = comments
+        .map((c, i) => ({ index: i + 1, dataUrl: c.cropDataUrl || '' }))
+        .filter((x) => x.dataUrl);
+      if (overviewDataUrl || crops.length) {
+        const res = await callServer('app_save_review_crops', {
+          sourceFileName: state.fileName || 'preview',
+          overviewDataUrl,
+          crops,
+        });
+        if (res?.ok) {
+          overviewPath = res.overviewPath || '';
+          for (const cp of res.cropPaths || []) {
+            cropPathMap.set(cp.index, cp.path);
+          }
+        }
+      }
+    } catch {
+      // 裁剪落盘失败不阻断评论文本发送
+    }
+  }
+
+  const lines = [
+    `我对以下文件圈选了 ${comments.length} 处局部区域进行评论，请严格按对应位置的批注处理：`,
+    `- 目标文件：\`${targetPath}\`（尺寸 ${baseW} × ${baseH} ${unit}）`,
+  ];
+  if (overviewPath) {
+    lines.push(`- 红框编号标注总览图：\`${overviewPath}\`（可用 read_file 查看圈选位置）`);
+  }
+  lines.push('');
+
+  comments.forEach((c, i) => {
+    const num = i + 1;
+    const xPct1 = Math.round(c.x * 100);
+    const xPct2 = Math.round((c.x + c.w) * 100);
+    const yPct1 = Math.round(c.y * 100);
+    const yPct2 = Math.round((c.y + c.h) * 100);
+    const pageStr = c.kind === 'pdf' ? `第 ${c.pageIndex + 1} 页 · ` : '';
+    const cropPath = cropPathMap.get(num);
+    const cropStr = cropPath ? `；局部高清图：\`${cropPath}\`` : '';
+    lines.push(
+      `${num}. **区域 #${num}**（${pageStr}区域框 \`x=${c.px}, y=${c.py}, w=${c.pw}, h=${c.ph}\` ${unit}；相对位置 左 ${xPct1}%–${xPct2}%、上 ${yPct1}%–${yPct2}%${cropStr}）`,
+    );
+    lines.push(`   - 评论：${c.text}`);
+  });
+
+  return lines.join('\n');
+}
+
+async function syncCommentsToHostContext() {
+  if (!state.connected) return false;
+  if (!state.previewComments.length) {
+    try {
+      await app.updateModelContext({ content: [] });
+    } catch {
+      // 忽略无上下文能力表面
+    }
+    return false;
+  }
+  try {
+    const text = await persistReviewCropsAndFormat(state.previewComments);
+    await app.updateModelContext({ content: [{ type: 'text', text }] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function commitActiveComment({ sendNow = false } = {}) {
+  const draft = state.activeCommentDraft;
+  const text = els.inpPcommentText.value.trim();
+  if (!draft) return;
+
+  if (!text) {
+    showToast('请先输入评论内容', 1800);
+    els.inpPcommentText.focus();
+    return;
+  }
+
+  const { img } = getPreviewAnnotEls(draft.kind);
+  if (draft.mode === 'edit') {
+    const target = state.previewComments.find((c) => c.id === draft.id);
+    if (target) {
+      target.text = text;
+    }
+  } else {
+    const cropDataUrl = captureRegionCropDataUrl(img, draft);
+    state.previewComments.push({
+      id: draft.id,
+      kind: draft.kind,
+      pageIndex: draft.pageIndex,
+      x: draft.x,
+      y: draft.y,
+      w: draft.w,
+      h: draft.h,
+      px: draft.px,
+      py: draft.py,
+      pw: draft.pw,
+      ph: draft.ph,
+      text,
+      cropDataUrl,
+    });
+  }
+
+  closeCommentPopover();
+
+  if (sendNow) {
+    await sendAllPreviewCommentsToAi();
+  } else {
+    const synced = await syncCommentsToHostContext();
+    showToast(
+      synced
+        ? `已添加第 ${state.previewComments.length} 条圈选评论（已挂到对话上下文，可继续圈选或点「发送给 AI」）`
+        : `已添加第 ${state.previewComments.length} 条圈选评论（可继续圈选，完成后点「发送给 AI」）`,
+      3000,
+    );
+  }
+}
+
+async function deleteActiveComment() {
+  const draft = state.activeCommentDraft;
+  if (!draft || draft.mode !== 'edit') {
+    closeCommentPopover();
+    return;
+  }
+  state.previewComments = state.previewComments.filter((c) => c.id !== draft.id);
+  closeCommentPopover();
+  await syncCommentsToHostContext();
+  showToast('已删除该条圈选评论', 1800);
+}
+
+function clearPreviewComments({ silent = false } = {}) {
+  state.previewComments = [];
+  state.activeCommentDraft = null;
+  els.previewCommentPopover.classList.add('hidden');
+  renderPreviewCommentOverlays();
+  if (state.connected) {
+    app.updateModelContext({ content: [] }).catch(() => {});
+  }
+  if (!silent) showToast('已清空圈选评论', 1600);
+}
+
+async function sendAllPreviewCommentsToAi() {
+  if (!state.previewComments.length) {
+    showToast('暂无圈选评论，请在图片上拖拽框选区域', 2200);
+    return;
+  }
+  showToast('正在生成红框标注与局部高清裁剪...', 1600);
+  const text = await persistReviewCropsAndFormat(state.previewComments);
+
+  // 1. 优先直接发往所属对话
+  if (state.connected) {
+    try {
+      const res = await app.sendMessage({
+        role: 'user',
+        content: [{ type: 'text', text }],
+      });
+      if (!res?.isError) {
+        const count = state.previewComments.length;
+        clearPreviewComments({ silent: true });
+        showToast(`已将 ${count} 条圈选评论与红框标注发给 AI`, 2800);
+        return;
+      }
+    } catch {
+      // 宿主表面不支持 sendMessage 时继续降级
+    }
+
+    // 2. 降级尝试挂载到下一条对话消息上下文 + 同步复制一份到剪贴板
+    let contextAttached = false;
+    try {
+      await app.updateModelContext({ content: [{ type: 'text', text }] });
+      contextAttached = true;
+    } catch {
+      // 忽略
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // 忽略剪贴板权限错误
+    }
+    showToast(
+      contextAttached
+        ? `已将 ${state.previewComments.length} 条圈选评论挂载到对话（并已复制），在左侧发送消息即可`
+        : `已复制 ${state.previewComments.length} 条圈选评论与标注图路径，在左侧对话 Ctrl+V 发送即可`,
+      3800,
+    );
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast('已复制圈选评论与标注图路径，粘贴到对话即可', 3200);
+  } catch {
+    showToast('请连接 Antigravity 对话后再发送圈选评论', 3000);
+  }
+}
+
+function bindPreviewRegionDrag(kind) {
+  const { stage, img, layer } = getPreviewAnnotEls(kind);
+  if (!stage || !img || !layer) return;
+
+  stage.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    if (state.viewMode !== 'preview') return;
+    if (e.target.closest('.annot-box')) return;
+    const rect = img.getBoundingClientRect();
+    if (rect.width < 12 || rect.height < 12) return;
+
+    closePreviewMenu();
+    if (state.activeCommentDraft) closeCommentPopover();
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let dragging = false;
+    let draftEl = null;
+    let dimEl = null;
+    let lastNorm = null;
+    let lastClientRect = null;
+
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      if (!dragging && Math.hypot(dx, dy) < 8) return;
+      if (!dragging) {
+        dragging = true;
+        draftEl = document.createElement('div');
+        draftEl.className = 'annot-draft';
+        dimEl = document.createElement('span');
+        dimEl.className = 'annot-draft-dim';
+        draftEl.appendChild(dimEl);
+        layer.appendChild(draftEl);
+      }
+      ev.preventDefault();
+
+      const curRect = img.getBoundingClientRect();
+      const cx0 = Math.max(curRect.left, Math.min(curRect.right, startX));
+      const cy0 = Math.max(curRect.top, Math.min(curRect.bottom, startY));
+      const cx1 = Math.max(curRect.left, Math.min(curRect.right, ev.clientX));
+      const cy1 = Math.max(curRect.top, Math.min(curRect.bottom, ev.clientY));
+
+      const leftPx = Math.min(cx0, cx1);
+      const topPx = Math.min(cy0, cy1);
+      const widthPx = Math.abs(cx1 - cx0);
+      const heightPx = Math.abs(cy1 - cy0);
+
+      const x = Math.max(0, Math.min(1, (leftPx - curRect.left) / curRect.width));
+      const y = Math.max(0, Math.min(1, (topPx - curRect.top) / curRect.height));
+      const w = Math.max(0, Math.min(1 - x, widthPx / curRect.width));
+      const h = Math.max(0, Math.min(1 - y, heightPx / curRect.height));
+      lastNorm = { x, y, w, h };
+      lastClientRect = {
+        left: leftPx,
+        top: topPx,
+        right: leftPx + widthPx,
+        bottom: topPx + heightPx,
+        width: widthPx,
+        height: heightPx,
+      };
+
+      draftEl.style.left = `${(x * 100).toFixed(4)}%`;
+      draftEl.style.top = `${(y * 100).toFixed(4)}%`;
+      draftEl.style.width = `${(w * 100).toFixed(4)}%`;
+      draftEl.style.height = `${(h * 100).toFixed(4)}%`;
+
+      const c = computeRegionCoords(kind, x, y, w, h);
+      const { unit } = getPreviewTrueDims(kind);
+      dimEl.textContent = `${c.pw} × ${c.ph} ${unit}`;
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      if (draftEl) draftEl.remove();
+      if (dragging && lastNorm && lastClientRect && lastClientRect.width >= 10 && lastClientRect.height >= 10) {
+        openCommentPopoverForCreate(kind, lastNorm, lastClientRect);
+      }
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  });
+}
+
+bindPreviewRegionDrag('image');
+bindPreviewRegionDrag('pdf');
+
+els.btnPcommentClose.addEventListener('click', () => closeCommentPopover());
+els.btnPcommentSave.addEventListener('click', () => commitActiveComment({ sendNow: false }));
+els.btnPcommentSend.addEventListener('click', () => commitActiveComment({ sendNow: true }));
+els.btnPcommentDelete.addEventListener('click', () => deleteActiveComment());
+els.inpPcommentText.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeCommentPopover();
+    return;
+  }
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    commitActiveComment({ sendNow: true });
+    return;
+  }
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    commitActiveComment({ sendNow: false });
+  }
+});
+els.btnPimgSendComments.addEventListener('click', () => sendAllPreviewCommentsToAi());
+els.btnPimgClearComments.addEventListener('click', () => clearPreviewComments());
+els.btnPpdfSendComments.addEventListener('click', () => sendAllPreviewCommentsToAi());
+els.btnPpdfClearComments.addEventListener('click', () => clearPreviewComments());
+
 // 键盘快捷键（微调方向键、撤销重做、保存、复制、删除、预览翻页）
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closePreviewMenu();
+    if (state.activeCommentDraft) closeCommentPopover();
   }
 
   if (state.viewMode === 'source') {
@@ -2622,7 +3243,7 @@ window.addEventListener('keydown', (e) => {
   if (state.viewMode === 'preview') {
     if (state.preview.mode === 'pdf') {
       const tag = document.activeElement?.tagName;
-      if (tag !== 'INPUT') {
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA') {
         if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
           e.preventDefault();
           previewGoToPdfPage(state.pdf.pageIndex - 1);

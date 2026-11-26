@@ -87,23 +87,37 @@
       </header>
 
       <div id="preview-body" class="preview-body">
-        <!-- 1. 纯净图片 / SVG / 画布成品预览 -->
+        <!-- 1. 纯净图片 / SVG / 画布成品预览（支持原生式拖拽圈选区域进行评论） -->
         <div id="preview-image-view" class="preview-image-view hidden">
+          <div id="preview-img-hint" class="preview-comment-hint">拖拽图片局部区域即可添加评论</div>
           <div id="preview-img-canvas" class="preview-img-canvas">
-            <img id="preview-img-el" class="preview-img-el" alt="" draggable="false" />
+            <div id="preview-img-stage" class="preview-annot-stage">
+              <img id="preview-img-el" class="preview-img-el" alt="" draggable="false" />
+              <div id="preview-img-annot" class="preview-annot-layer"></div>
+            </div>
           </div>
           <div id="preview-img-bar" class="preview-float-bar">
             <button id="btn-pimg-out" class="pfloat-btn" title="缩小">−</button>
             <button id="btn-pimg-fit" class="pfloat-val" title="适应窗口">100%</button>
             <button id="btn-pimg-in" class="pfloat-btn" title="放大">+</button>
             <span id="lbl-pimg-dim" class="pfloat-dim"></span>
+            <span id="pimg-comment-group" class="pfloat-comment-group hidden">
+              <span class="pfloat-sep"></span>
+              <span id="lbl-pimg-comments" class="pfloat-comment-count">0 条评论</span>
+              <button id="btn-pimg-send-comments" class="pfloat-send-btn" title="将全部圈选评论与标注图发给对话中的 AI">发送给 AI</button>
+              <button id="btn-pimg-clear-comments" class="pfloat-btn" title="清空全部圈选评论">×</button>
+            </span>
           </div>
         </div>
 
-        <!-- 2. 纯净多页 PDF 阅读预览 -->
+        <!-- 2. 纯净多页 PDF 阅读预览（同样支持拖拽页面局部区域添加评论） -->
         <div id="preview-pdf-view" class="preview-pdf-view hidden">
+          <div id="preview-pdf-hint" class="preview-comment-hint">拖拽页面局部区域即可添加评论</div>
           <div id="preview-pdf-scroll" class="preview-pdf-scroll">
-            <img id="preview-pdf-img" class="preview-pdf-img" alt="PDF 页面预览" draggable="false" />
+            <div id="preview-pdf-stage" class="preview-annot-stage">
+              <img id="preview-pdf-img" class="preview-pdf-img" alt="PDF 页面预览" draggable="false" />
+              <div id="preview-pdf-annot" class="preview-annot-layer"></div>
+            </div>
           </div>
           <div id="preview-pdf-bar" class="preview-float-bar">
             <button id="btn-ppdf-prev" class="pfloat-btn" title="上一页">
@@ -119,6 +133,12 @@
             <button id="btn-ppdf-out" class="pfloat-btn" title="缩小">−</button>
             <button id="btn-ppdf-fit" class="pfloat-val" title="适应宽度">100%</button>
             <button id="btn-ppdf-in" class="pfloat-btn" title="放大">+</button>
+            <span id="ppdf-comment-group" class="pfloat-comment-group hidden">
+              <span class="pfloat-sep"></span>
+              <span id="lbl-ppdf-comments" class="pfloat-comment-count">0 条评论</span>
+              <button id="btn-ppdf-send-comments" class="pfloat-send-btn" title="将全部圈选评论与标注图发给对话中的 AI">发送给 AI</button>
+              <button id="btn-ppdf-clear-comments" class="pfloat-btn" title="清空全部圈选评论">×</button>
+            </span>
           </div>
         </div>
 
@@ -130,6 +150,21 @@
         <!-- 4. 纯净 HTML 渲染预览 -->
         <div id="preview-html-view" class="preview-html-view hidden">
           <div id="preview-html-host" class="preview-html-host"></div>
+        </div>
+
+        <!-- 圈选区域评论极简浮动输入卡片 -->
+        <div id="preview-comment-popover" class="pcomment-popover hidden" role="dialog" aria-label="区域评论">
+          <div class="pcomment-head">
+            <span id="pcomment-title" class="pcomment-title">区域 #1</span>
+            <button id="btn-pcomment-close" class="pcomment-close" title="关闭 (Esc)">×</button>
+          </div>
+          <textarea id="inp-pcomment-text" class="pcomment-input" rows="2" placeholder="输入对该区域的批注或修改要求…"></textarea>
+          <div class="pcomment-foot">
+            <button id="btn-pcomment-delete" class="pcomment-del-btn hidden">删除</button>
+            <span class="pcomment-foot-spacer"></span>
+            <button id="btn-pcomment-save" class="pcomment-sec-btn" title="Enter">添加评论</button>
+            <button id="btn-pcomment-send" class="pcomment-pri-btn" title="Ctrl+Enter">发给 AI</button>
+          </div>
         </div>
       </div>
     </div>
