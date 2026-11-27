@@ -1031,18 +1031,19 @@ async function openHostFile(hostFile) {
       hostReadErr = err;
     }
 
-    // ---------- 路径 A：超过宿主 10 MiB 限制或宿主拒读 → 自动走本地服务端直读回退 ----------
+    // ---------- 路径 A：超过宿主 10 MiB 限制、原路径归档移动或宿主拒读 → 自动走本地服务端直读回退 ----------
     if (hostReadErr) {
       const expectedBytes = extractExpectedBytes(hostReadErr.message);
       els.previewMeta.textContent = expectedBytes
         ? `原图 ${formatBytesShort(expectedBytes)}，本地高清直读中...`
-        : '本地直读中...';
+        : '正在自动定位本地文件...';
 
       const fb = await callServer('app_load_host_fallback', {
         fileName,
         resourceUri: hostFile.resourceUri,
         expectedBytes,
         matchedDiskPath: state.matchedDiskPath || '',
+        hostError: String(hostReadErr.message || ''),
       });
       if (!fb?.ok) {
         throw hostReadErr;
@@ -1129,6 +1130,9 @@ async function openHostFile(hostFile) {
       updateRevealButtons();
       updatePreviewMenuUi();
       setDirty(false);
+      if (fb.relocatedFromMissingHost && fb.filePath) {
+        showToast(`原路径文件已移动，已自动从新位置打开：${fb.filePath}`, 3600);
+      }
       return;
     }
 

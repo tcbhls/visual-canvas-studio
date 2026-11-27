@@ -663,7 +663,7 @@ function findDiskPathForHostFile(fileName, { expectedBytes = 0, extra = null, ma
     }
   }
 
-  // 4. 汇总所有活跃工作区、近期会话工作区与项目聚合父目录进行有限深度快速搜索
+  // 4. 汇总所有活跃工作区、近期会话提取的项目目录与聚合父目录进行有限深度快速搜索
   const recentWs = collectRecentWorkspaces(20);
   const uriDirs = [];
   const uuidMatch = /^antigravity-file:\/\/([0-9a-f-]{16,})\//i.exec(resourceUri || '');
@@ -672,22 +672,35 @@ function findDiskPathForHostFile(fileName, { expectedBytes = 0, extra = null, ma
     if (existsSync(brainCandidate)) uriDirs.push(brainCandidate);
   }
 
+  // 把 state.json 历史目录的向上 2 级项目根也纳入候选，避免 lastWorkspace 停在深层子目录搜不到同级兄弟目录
+  const stateAncestors = [];
+  for (const base of [st.lastWorkspace, getDefaultWorkspace()]) {
+    if (!base) continue;
+    let cur = base;
+    for (let k = 0; k < 3 && cur; k++) {
+      if (existsSync(cur)) stateAncestors.push(cur);
+      const p = dirname(cur);
+      if (!p || p === cur || p.length <= 3) break;
+      cur = p;
+    }
+  }
+
   const primaryDirs = [
     ...uriDirs,
     ...(ctx.workspaceDirs || []),
     effectiveCtx.artifactsDir,
     convScan.workspaceDir,
-    getDefaultWorkspace(),
     ...recentWs.workspaces,
+    ...stateAncestors,
     ...recentWs.artifactDirs,
   ].filter(Boolean);
 
-  const hitPrimary = findFileByNameInDirs(targetName, primaryDirs, 4, expectedBytes);
+  const hitPrimary = findFileByNameInDirs(targetName, primaryDirs, 5, expectedBytes);
   if (hitPrimary) return hitPrimary;
 
   // 5. 同级项目聚合目录兜底（例如 D:\antigravity work 下新建的其他项目文件夹）
   if (recentWs.parentWorkspaces.length) {
-    const hitParent = findFileByNameInDirs(targetName, recentWs.parentWorkspaces, 5, expectedBytes);
+    const hitParent = findFileByNameInDirs(targetName, recentWs.parentWorkspaces, 6, expectedBytes);
     if (hitParent) return hitParent;
   }
 
@@ -1618,10 +1631,11 @@ registerAppTool(
       resourceUri: z.string().optional(),
       expectedBytes: z.number().optional(),
       matchedDiskPath: z.string().optional(),
+      hostError: z.string().optional(),
     }),
     _meta: APP_ONLY_META,
   },
-  async ({ fileName, resourceUri = '', expectedBytes = 0, matchedDiskPath = '' }, extra) => {
+  async ({ fileName, resourceUri = '', expectedBytes = 0, matchedDiskPath = '', hostError = '' }, extra) => {
     try {
       const convId = extractConvContext(extra).conversationId;
       const diskPath = findDiskPathForHostFile(fileName, {
@@ -1631,14 +1645,24 @@ registerAppTool(
         resourceUri,
       });
       if (!diskPath || !existsSync(diskPath)) {
-        throw new Error(`文件超过宿主 10 MiB 限制，且未能在工作区自动定位本地路径：${fileName}`);
+        const isSizeLimit = /exceeds limit|10485760|10\s*MiB|too large/i.test(hostError || '');
+        if (isSizeLimit) {
+          throw new Error(`文件超过宿主 10 MiB 限制，且未能在工作区自动定位本地路径：${fileName}`);
+        }
+        throw new Error(
+          hostError
+            ? `原文件可能已被删除或移动，且磁盘中未找到同名文件：${fileName}（宿主提示：${hostError}）`
+            : `未能定位该本地文件（可能已被移动或删除）：${fileName}`,
+        );
       }
       const payload = loadVisualFile(diskPath, convId);
+      const isSizeLimit = /exceeds limit|10485760|10\s*MiB|too large/i.test(hostError || '');
       return {
-        content: [{ type: 'text', text: `已通过本地直读打开大文件：${payload.fileName}` }],
+        content: [{ type: 'text', text: `已通过本地直读打开文件：${payload.fileName}` }],
         structuredContent: {
           ...payload,
           loadedViaDiskFallback: true,
+          relocatedFromMissingHost: !isSizeLimit,
         },
       };
     } catch (err) {

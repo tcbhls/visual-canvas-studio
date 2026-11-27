@@ -73,8 +73,53 @@ export function extractConvContext(extra) {
 }
 
 /**
- * 扫描最近活跃的多个 Antigravity 会话，聚合所有出现过的工作区根目录与聚合父目录，
- * 解决跨工作区打开大文件或相对路径图片时定位不到磁盘原文件的问题。
+ * 从文本块（含 JSON 转义反斜杠与 file:/// 链接）提取存在的非内部目录路径，
+ * 并向上补齐最多 3 层项目祖先目录（自动排除盘符根与用户主目录），实现跨工作区零遗漏发现。
+ */
+function collectAncestorDirs(rawDir, outList, seenSet, maxClimb = 3) {
+  const homeLower = normalize(homedir()).toLowerCase();
+  let cur = uriToLocalPath(rawDir);
+  if (!cur) return;
+  try {
+    if (existsSync(cur) && statSync(cur).isFile()) {
+      cur = dirname(cur);
+    }
+  } catch {
+    return;
+  }
+  for (let step = 0; step <= maxClimb && cur; step++) {
+    const low = cur.toLowerCase();
+    const rootLow = parse(cur).root.toLowerCase();
+    if (
+      low === rootLow ||
+      low === homeLower ||
+      low.endsWith(':\\users') ||
+      low.includes('\\.gemini\\antigravity\\') ||
+      low.includes('\\appdata\\') ||
+      low.includes('\\windows\\') ||
+      low.includes('\\program files')
+    ) {
+      break;
+    }
+    if (existsSync(cur) && !seenSet.has(low)) {
+      try {
+        if (statSync(cur).isDirectory()) {
+          seenSet.add(low);
+          outList.push(cur);
+        }
+      } catch {
+        // 忽略无权限目录
+      }
+    }
+    const parent = dirname(cur);
+    if (!parent || parent === cur) break;
+    cur = parent;
+  }
+}
+
+/**
+ * 扫描最近活跃的多个 Antigravity 会话日志，从真实工具调用与交付路径中提取所有活跃项目目录与聚合父目录，
+ * 彻底解决 transcript.jsonl 不含系统提示词导致此前工作区列表为空的问题。
  */
 export function collectRecentWorkspaces(maxConvs = 20) {
   const workspaces = [];
@@ -84,22 +129,27 @@ export function collectRecentWorkspaces(maxConvs = 20) {
   const seenParents = new Set();
   const homeLower = normalize(homedir()).toLowerCase();
 
-  const addWs = (raw) => {
-    const p = uriToLocalPath(raw);
-    if (!p || !existsSync(p)) return;
-    const low = p.toLowerCase();
-    if (!seenWs.has(low)) {
-      seenWs.add(low);
-      workspaces.push(p);
+  const registerPathDir = (raw) => {
+    const cleaned = cleanMatchedPath(raw);
+    if (!cleaned) return;
+    const low = cleaned.toLowerCase();
+    if (isIgnoredInternalPath(low) || low.includes('\\.gemini\\antigravity\\')) return;
+    if (!existsSync(cleaned)) return;
+    let dir = cleaned;
+    try {
+      const st = statSync(cleaned);
+      if (st.isFile()) dir = dirname(cleaned);
+    } catch {
+      return;
     }
-    const parent = dirname(p);
-    if (parent && parent !== p) {
-      const pLow = parent.toLowerCase();
-      const rootLow = parse(parent).root.toLowerCase();
-      // 仅纳入类似 D:\antigravity work 这类项目聚合目录，避开盘符根目录与用户主目录
-      if (pLow !== rootLow && pLow !== homeLower && !pLow.endsWith(':\\users') && !seenParents.has(pLow)) {
-        seenParents.add(pLow);
-        parentWorkspaces.push(parent);
+    collectAncestorDirs(dir, workspaces, seenWs, 2);
+    const grand = dirname(dirname(dir));
+    if (grand && grand !== dir) {
+      const gLow = grand.toLowerCase();
+      const rootLow = parse(grand).root.toLowerCase();
+      if (gLow !== rootLow && gLow !== homeLower && !gLow.endsWith(':\\users') && !seenParents.has(gLow) && existsSync(grand)) {
+        seenParents.add(gLow);
+        parentWorkspaces.push(grand);
       }
     }
   };
@@ -127,27 +177,24 @@ export function collectRecentWorkspaces(maxConvs = 20) {
   }
 
   convs.sort((a, b) => b.mtime - a.mtime);
+  const ANY_WIN_PATH_RE = /(?:file:\/\/\/)?([A-Za-z]:(?:\\\\|[\\/])[^"'`\r\n<>|*?\])]{2,220})/g;
+
   for (const c of convs.slice(0, maxConvs)) {
     artifactDirs.push(c.dir);
     if (!existsSync(c.tx)) continue;
     try {
-      const fd = openSync(c.tx, 'r');
-      let head = '';
-      try {
-        const buf = Buffer.alloc(16384);
-        const bytesRead = readSync(fd, buf, 0, buf.length, 0);
-        head = buf.slice(0, bytesRead).toString('utf-8');
-      } finally {
-        closeSync(fd);
-      }
-      const blockMatch = /Active Workspaces:\s*(?:\\n|[\r\n])+([\s\S]{1,1200}?)(?:Command Working Directory:|App Data Directory:|\\n\\n|\r?\n\r?\n)/i.exec(head);
-      if (blockMatch) {
-        const cleanBlock = blockMatch[1].replace(/\\r\\n|\\n/g, '\n').replace(/\\\\/g, '\\');
-        const lineRe = /^\s*-\s*([A-Za-z]:[^\r\n"]+|\/[^\r\n"]+)/gm;
-        let m;
-        while ((m = lineRe.exec(cleanBlock)) !== null) {
-          addWs(m[1].trim());
-        }
+      const tail = readTailText(c.tx, 260 * 1024);
+      // 还原 JSON 多次转义反斜杠（\\\\ -> \）与换行字面量
+      const unescaped = tail.replace(/\\\\+/g, '\\').replace(/\\r|\\n/g, '\n');
+      ANY_WIN_PATH_RE.lastIndex = 0;
+      let m;
+      let hitsInConv = 0;
+      while ((m = ANY_WIN_PATH_RE.exec(unescaped)) !== null) {
+        const candidate = m[1].replace(/[.,;:]+$/, '');
+        if (candidate.toLowerCase().includes('\\.gemini\\antigravity\\')) continue;
+        registerPathDir(candidate);
+        hitsInConv++;
+        if (hitsInConv >= 80 || workspaces.length >= 60) break;
       }
     } catch {
       // 忽略单个日志读取失败
