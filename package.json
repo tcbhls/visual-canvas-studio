@@ -1,6 +1,6 @@
 {
   "name": "visual-canvas-studio",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "type": "module",
   "description": "Zero-intrusion on-demand side-pane visual editor plugin for Antigravity 2.0 (offline image layer splitting, background recolor, strict box cutout, multi-page CJK vector PDF editing, HTML/SVG/layered canvas).",
   "license": "MIT",

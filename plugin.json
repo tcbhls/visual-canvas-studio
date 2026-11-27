@@ -2,7 +2,7 @@
   "name": "visual-canvas-studio",
   "displayName": "Visual Canvas Studio（按需侧栏拆层微调 / PDF 直编）",
   "description": "零干扰按需侧栏可视化设计编辑器：不接管常规图片/PDF/Markdown 的原生预览与圈选评论；需要微调时从侧栏入口或对话按需打开当前会话的图片（离线智能拆层、前景/底图独立换色、零越界框选抠图）、多页 PDF（原位改字/填表/中文矢量写回）、HTML/SVG 与 .canvas.json 分层画布。",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "license": "MIT",
   "repository": "https://github.com/tcbhls/visual-canvas-studio",
   "logo": "assets/logo.svg",
