@@ -1090,9 +1090,9 @@ registerAppTool(
   server,
   'edit_visual_file',
   {
-    title: '可视化画布直编',
+    title: '可视化分层画布直编',
     description:
-      'Antigravity 原生文件接管入口：默认以纯净无打扰模式预览图片、PDF、Markdown、HTML、SVG 与 .canvas.json，点击右上角三个点中的「可视化画布编辑」即可原地切换为完整拆层微调与 PDF 原位改字模式。',
+      '仅接管插件专属分层画布格式（.canvas.json / .vcs.json）；常规图片、PDF、Markdown、HTML 等保持 Antigravity 原生预览与原生圈选评论零干扰，需要微调时通过侧栏「可视化画布编辑」入口或 open_visual_editor 按需打开。',
     inputSchema: z.object({
       file: z
         .object({
@@ -1111,21 +1111,8 @@ registerAppTool(
             type: 'file',
             title: '可视化画布编辑',
             extensions: [
-              '.png',
-              '.jpg',
-              '.jpeg',
-              '.webp',
-              '.gif',
-              '.bmp',
-              '.ico',
-              '.avif',
-              '.svg',
-              '.pdf',
-              '.html',
-              '.htm',
-              '.md',
-              '.markdown',
               '.canvas.json',
+              '.vcs.json',
             ],
           },
         ],

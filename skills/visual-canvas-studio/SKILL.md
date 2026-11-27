@@ -1,11 +1,11 @@
 ---
 name: visual-canvas-studio
-description: 在 Antigravity 中提供 15 种视觉与文档格式的纯净预览与按需可视化编辑（支持平面图离线自动拆层、前景/底图独立换色、零越界框选抠图、多页 PDF 原位改字与中文矢量写回、Markdown 图文内嵌图微调、HTML/SVG 鼠标直编及 .canvas.json 分层主图）。
+description: 零干扰按需侧栏可视化编辑插件：保留 Antigravity 原生图片/PDF/Markdown 预览与圈选评论，需要微调时从侧栏或对话按需打开平面图离线智能拆层、前景/底图独立换色、零越界框选抠图、多页 PDF 原位改字与中文矢量写回、HTML/SVG 鼠标直编及 .canvas.json 分层画布。
 ---
 
-# Visual Canvas Studio（纯净预览 / 智能拆层 / PDF 直编）
+# Visual Canvas Studio（按需侧栏微调 / 智能拆层 / PDF 直编）
 
-本插件原生接管 `.png`/`.jpg`/`.jpeg`/`.webp`/`.gif`/`.bmp`/`.ico`/`.avif`/`.svg`/`.pdf`/`.html`/`.htm`/`.md`/`.markdown`/`.canvas.json`，默认以纯净预览方式打开；操作者点击右上角 `⋮` →「可视化画布编辑」即可原地进入微调。
+本插件遵循**零干扰原则**：仅专属接管 `.canvas.json` / `.vcs.json` 分层画布，不拦截常规图片、PDF、Markdown、HTML 的原生预览与原生圈选评论；操作者需要微调时，通过右侧栏 `+ → 可视化画布编辑`、左侧边栏或直接让 AI 调用 `open_visual_editor` 按需打开当前会话文件。
 
 ## 工具说明
 
